@@ -1,0 +1,9 @@
+# Перевірений набір для macOS / Python 3.12. Оновлювати разом із smoke-тестом.
+catap==0.5.0
+sounddevice==0.5.5
+soundfile==0.14.0
+pyobjc-framework-AVFoundation==12.2.1
+
+mlx-whisper==0.4.3
+pyannote.audio==4.0.7
+torch==2.8.0

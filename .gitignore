@@ -1,0 +1,36 @@
+# Секрети — ніколи не комітити
+.env*
+!.env.example
+
+# Дані мітингів — приватні, живуть тільки локально
+recordings/
+transcripts/
+notes/
+failed/
+logs/
+
+# Аудіо й логи — захист навіть поза стандартними runtime-папками
+*.wav
+*.mp3
+*.m4a
+*.flac
+*.aac
+*.log
+
+# Оточення і службове
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.record.pid
+.control/
+.record.toggle.lock/
+.DS_Store
+
+# Локальні IDE та тимчасові файли
+.idea/
+.vscode/
+*.swp
+*.tmp
