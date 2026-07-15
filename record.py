@@ -9,6 +9,7 @@ import datetime
 import math
 import os
 import queue
+import re
 import signal
 import subprocess
 import sys
@@ -31,10 +32,13 @@ MAX_RECORD_SECONDS = int(os.environ.get("MAX_RECORD_SECONDS", "21600"))
 SILENCE_POPUP = os.environ.get("SILENCE_POPUP", "true").lower() == "true"
 SILENCE_SECONDS = float(os.environ.get("SILENCE_SECONDS", "90"))
 SILENCE_MIN_RECORD_SECONDS = float(
-    os.environ.get("SILENCE_MIN_RECORD_SECONDS", "120")
+    os.environ.get("SILENCE_MIN_RECORD_SECONDS", "90")
 )
 SILENCE_REPEAT_SECONDS = float(os.environ.get("SILENCE_REPEAT_SECONDS", "600"))
 SILENCE_DIALOG_TIMEOUT = int(os.environ.get("SILENCE_DIALOG_TIMEOUT", "30"))
+SILENCE_AUTO_STOP_SECONDS = float(
+    os.environ.get("SILENCE_AUTO_STOP_SECONDS", "300")
+)
 MIC_ACTIVITY_DBFS = float(os.environ.get("MIC_ACTIVITY_DBFS", "-42"))
 SYSTEM_ACTIVITY_DBFS = float(os.environ.get("SYSTEM_ACTIVITY_DBFS", "-50"))
 
@@ -153,35 +157,52 @@ def ndarray_rms_dbfs(indata) -> float:
 
 def av_buffer_rms_dbfs(buffer) -> float:
     """Максимальний RMS усіх Voice Processing channels з AVAudioPCMBuffer."""
-    frame_count = int(buffer.frameLength())
+    def value(obj, name):
+        attribute = getattr(obj, name)
+        return attribute() if callable(attribute) else attribute
+
+    frame_count = int(value(buffer, "frameLength"))
     if frame_count <= 0:
         return float("-inf")
     stride = max(1, frame_count // 1024)
-    fmt = buffer.format()
-    common_format = int(fmt.commonFormat())
-    channel_count = int(fmt.channelCount())
+    fmt = value(buffer, "format")
+    common_format = int(value(fmt, "commonFormat"))
+    channel_count = int(value(fmt, "channelCount"))
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message=r"PyObjCPointer created:.*")
         if common_format == 1:
-            pointer = buffer.floatChannelData()
+            pointer = value(buffer, "floatChannelData")
             sample_type, scale = ctypes.c_float, 1.0
         elif common_format == 3:
-            pointer = buffer.int16ChannelData()
+            pointer = value(buffer, "int16ChannelData")
             sample_type, scale = ctypes.c_int16, 32768.0
         elif common_format == 4:
-            pointer = buffer.int32ChannelData()
+            pointer = value(buffer, "int32ChannelData")
             sample_type, scale = ctypes.c_int32, 2147483648.0
         else:
             return float("-inf")
     if pointer is None:
         return float("-inf")
-    channels = ctypes.cast(
-        pointer.pointerAsInteger,
-        ctypes.POINTER(ctypes.POINTER(sample_type)),
-    )
+    channels = None
+    pointer_address = getattr(pointer, "pointerAsInteger", None)
+    if pointer_address is not None:
+        pointer_address = (pointer_address() if callable(pointer_address)
+                           else pointer_address)
+        channels = ctypes.cast(
+            pointer_address,
+            ctypes.POINTER(ctypes.POINTER(sample_type)),
+        )
     loudest = float("-inf")
     for channel_index in range(channel_count):
-        channel = channels[channel_index]
+        # Callback buffers можуть повертати objc.varlist, тоді як створені
+        # вручну buffers повертають PyObjCPointer. Підтримуємо обидва API.
+        try:
+            channel = pointer[channel_index]
+            _ = channel[0]
+        except (AttributeError, IndexError, TypeError):
+            if channels is None:
+                raise TypeError("Невідомий тип AVAudioPCMBuffer channel pointer")
+            channel = channels[channel_index]
         squares = [
             (float(channel[index]) / scale) ** 2
             for index in range(0, frame_count, stride)
@@ -198,6 +219,7 @@ class AudioActivityMonitor:
                  silence_seconds: float = SILENCE_SECONDS,
                  min_record_seconds: float = SILENCE_MIN_RECORD_SECONDS,
                  repeat_seconds: float = SILENCE_REPEAT_SECONDS,
+                 auto_stop_seconds: float = SILENCE_AUTO_STOP_SECONDS,
                  mic_threshold: float = MIC_ACTIVITY_DBFS,
                  system_threshold: float = SYSTEM_ACTIVITY_DBFS,
                  started_at: float | None = None) -> None:
@@ -205,6 +227,7 @@ class AudioActivityMonitor:
         self.silence_seconds = silence_seconds
         self.min_record_seconds = min_record_seconds
         self.repeat_seconds = repeat_seconds
+        self.auto_stop_seconds = auto_stop_seconds
         self.mic_threshold = mic_threshold
         self.system_threshold = system_threshold
         self.started_at = time.monotonic() if started_at is None else started_at
@@ -214,6 +237,8 @@ class AudioActivityMonitor:
         self._mic_last_activity = self.started_at
         self._system_last_activity = self.started_at
         self._last_prompt: float | None = None
+        self._snoozed_until: float | None = None
+        self._auto_stop_at: float | None = None
         self._mic_dbfs = float("-inf")
         self._system_dbfs = float("-inf")
         self._prompt_count = 0
@@ -225,6 +250,8 @@ class AudioActivityMonitor:
             self._mic_last_activity = started_at
             self._system_last_activity = started_at
             self._last_prompt = None
+            self._snoozed_until = None
+            self._auto_stop_at = None
 
     def observe_mic(self, dbfs: float, *, now: float | None = None) -> None:
         current = time.monotonic() if now is None else now
@@ -233,6 +260,9 @@ class AudioActivityMonitor:
             self._mic_dbfs = dbfs
             if dbfs >= self.mic_threshold:
                 self._mic_last_activity = current
+                self._last_prompt = None
+                self._snoozed_until = None
+                self._auto_stop_at = None
 
     def observe_system(self, dbfs: float, *, now: float | None = None) -> None:
         current = time.monotonic() if now is None else now
@@ -241,6 +271,9 @@ class AudioActivityMonitor:
             self._system_dbfs = dbfs
             if dbfs >= self.system_threshold:
                 self._system_last_activity = current
+                self._last_prompt = None
+                self._snoozed_until = None
+                self._auto_stop_at = None
 
     def observe_system_buffer(self, buffer) -> None:
         try:
@@ -260,6 +293,8 @@ class AudioActivityMonitor:
                 return False
             if current - self.started_at < self.min_record_seconds:
                 return False
+            if self._snoozed_until is not None and current < self._snoozed_until:
+                return False
             if current - self._mic_last_activity < self.silence_seconds:
                 return False
             if current - self._system_last_activity < self.silence_seconds:
@@ -275,6 +310,37 @@ class AudioActivityMonitor:
             self._last_prompt = current
             self._prompt_count += 1
 
+    def mark_continued(self, *, now: float | None = None) -> None:
+        """Явне «Продовжити»: відкладає наступний popup та auto-stop."""
+        current = time.monotonic() if now is None else now
+        with self._lock:
+            self._last_prompt = current
+            self._snoozed_until = current + self.repeat_seconds
+            self._auto_stop_at = None
+
+    def mark_unanswered(self, *, now: float | None = None) -> None:
+        """Після timeout планує stop на 5-й хвилині безперервної тиші."""
+        current = time.monotonic() if now is None else now
+        with self._lock:
+            silence_age = current - max(
+                self._mic_last_activity, self._system_last_activity
+            )
+            remaining = max(0.0, self.auto_stop_seconds - silence_age)
+            self._auto_stop_at = current + remaining
+
+    def should_auto_stop(self, *, now: float | None = None) -> bool:
+        current = time.monotonic() if now is None else now
+        with self._lock:
+            if not self.enabled or self._auto_stop_at is None:
+                return False
+            if current < self._auto_stop_at:
+                return False
+            if current - self._mic_last_activity < self.auto_stop_seconds:
+                return False
+            if current - self._system_last_activity < self.auto_stop_seconds:
+                return False
+            return True
+
     def snapshot(self) -> dict[str, Any]:
         def finite_level(value: float) -> float | None:
             return round(value, 2) if math.isfinite(value) else None
@@ -282,6 +348,7 @@ class AudioActivityMonitor:
         with self._lock:
             return {
                 "silence_prompts": self._prompt_count,
+                "silence_auto_stop_seconds": self.auto_stop_seconds,
                 "last_mic_dbfs": finite_level(self._mic_dbfs),
                 "last_system_dbfs": finite_level(self._system_dbfs),
                 "mic_activity_threshold_dbfs": self.mic_threshold,
@@ -289,7 +356,7 @@ class AudioActivityMonitor:
             }
 
 
-def ask_finish_after_silence(stop_event: threading.Event) -> bool:
+def ask_finish_after_silence(stop_event: threading.Event) -> str:
     script = (
         f'display dialog "На обох доріжках немає аудіо вже '
         f'{int(SILENCE_SECONDS)} секунд.\\n\\nЗавершити запис?" '
@@ -311,11 +378,16 @@ def ask_finish_after_silence(stop_event: threading.Event) -> bool:
                 process.wait(timeout=2)
             except subprocess.TimeoutExpired:
                 process.kill()
-            return False
+            return "timeout"
         time.sleep(0.2)
     output = process.stdout.read().strip() if process.stdout else ""
-    return ("button returned:Завершити запис" in output
-            and "gave up:true" not in output)
+    if "gave up:true" in output:
+        return "timeout"
+    if "button returned:Завершити запис" in output:
+        return "finish"
+    if "button returned:Продовжити" in output:
+        return "continue"
+    return "timeout"
 
 
 class RecordingSupervisor:
@@ -341,14 +413,27 @@ class RecordingSupervisor:
                 print(f"[supervisor] ліміт {self.max_seconds:.0f} с → safe stop")
                 _request_stop("max-duration")
                 return
+            if self.monitor.should_auto_stop(now=now):
+                print(f"[silence] {SILENCE_AUTO_STOP_SECONDS:.0f} с тиші "
+                      "без відповіді → safe stop")
+                _request_stop("silence-timeout")
+                return
             if self.monitor.should_prompt(now=now):
                 self.monitor.mark_prompted(now=now)
                 print(f"[silence] обидві доріжки тихі {SILENCE_SECONDS:.0f} с → popup")
-                if ask_finish_after_silence(self._stop_event):
+                result = ask_finish_after_silence(self._stop_event)
+                if result == "finish":
                     print("[silence] користувач підтвердив завершення")
                     _request_stop("silence-confirmed")
                     return
-                print("[silence] запис продовжується")
+                if result == "continue":
+                    self.monitor.mark_continued()
+                    print(f"[silence] продовжую; нагадування через "
+                          f"{SILENCE_REPEAT_SECONDS:.0f} с")
+                else:
+                    self.monitor.mark_unanswered()
+                    print(f"[silence] немає відповіді; auto-stop після "
+                          f"{SILENCE_AUTO_STOP_SECONDS:.0f} с тиші")
 
 
 def start_system_audio(sys_path: Path, monitor: AudioActivityMonitor):
@@ -411,20 +496,40 @@ def record_mic_raw(mic_path: Path, system_session,
                 output.write(audio_q.get_nowait())
 
 
-def _loudest_file_channel(path: Path) -> tuple[int, list[float]]:
-    import numpy as np
-    import soundfile as sf
+def _parse_astats_levels(output: str) -> list[float]:
+    """Витягає per-channel RMS із ffmpeg astats (не Overall)."""
+    levels: dict[int, float] = {}
+    channel: int | None = None
+    for line in output.splitlines():
+        match = re.search(r"Channel:\s+(\d+)", line)
+        if match:
+            channel = int(match.group(1)) - 1
+            continue
+        if "Overall" in line:
+            channel = None
+            continue
+        match = re.search(r"RMS level dB:\s+([-+\w.]+)", line)
+        if match and channel is not None:
+            try:
+                levels[channel] = float(match.group(1))
+            except ValueError:
+                levels[channel] = float("-inf")
+    if not levels:
+        raise RuntimeError("ffmpeg не повернув RMS рівні AEC-каналів")
+    return [levels.get(index, float("-inf"))
+            for index in range(max(levels) + 1)]
 
-    with sf.SoundFile(path) as source:
-        sums = np.zeros(source.channels, dtype="float64")
-        samples = 0
-        for block in source.blocks(blocksize=65_536, dtype="float32", always_2d=True):
-            sums += np.sum(block.astype("float64") ** 2, axis=0)
-            samples += len(block)
-    levels = [
-        _dbfs(math.sqrt(float(value) / max(1, samples)))
-        for value in sums
-    ]
+
+def _loudest_file_channel(path: Path) -> tuple[int, list[float]]:
+    """Обирає найгучніший канал, зокрема у BW64-файлах понад 4 GB."""
+    result = subprocess.run(
+        [find_ffmpeg(), "-hide_banner", "-nostats", "-i", str(path),
+         "-af", "astats=metadata=0:reset=0", "-f", "null", "-"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    levels = _parse_astats_levels(result.stderr)
     return max(range(len(levels)), key=levels.__getitem__), levels
 
 
@@ -432,8 +537,8 @@ def to_mono(path: Path) -> dict[str, Any]:
     """Обирає найгучніший Voice Processing channel і зводить його в mono."""
     ffmpeg = find_ffmpeg()
     tmp = path.with_name(f".{path.stem}.mono.wav")
-    selected, levels = _loudest_file_channel(path)
     try:
+        selected, levels = _loudest_file_channel(path)
         subprocess.run(
             [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(path),
              "-af", f"pan=mono|c0=c{selected}", "-c:a", "pcm_s16le", str(tmp)],
@@ -448,7 +553,10 @@ def to_mono(path: Path) -> dict[str, Any]:
         }
     except subprocess.CalledProcessError as exc:
         tmp.unlink(missing_ok=True)
-        detail = exc.stderr.decode(errors="replace")[-300:]
+        detail = exc.stderr
+        if isinstance(detail, bytes):
+            detail = detail.decode(errors="replace")
+        detail = (detail or "")[-300:]
         raise RuntimeError(f"Не вдалося звести AEC WAV у моно: {detail}") from exc
 
 
@@ -493,14 +601,19 @@ def record_mic_aec(mic_path: Path, system_session,
     if audio_file is None:
         raise RuntimeError(f"Не створився вихідний файл: {err}")
 
+    meter_error_reported = False
+
     def tap(buffer, when):
         global MIC_FIRST_FRAME_AT
+        nonlocal meter_error_reported
         MIC_FIRST_FRAME_AT = MIC_FIRST_FRAME_AT or time.monotonic()
         try:
             monitor.observe_mic(av_buffer_rms_dbfs(buffer))
         except Exception as exc:
-            print(f"[silence] AEC meter error: {exc.__class__.__name__}",
-                  file=sys.stderr)
+            if not meter_error_reported:
+                meter_error_reported = True
+                print(f"[silence] AEC meter error: {exc.__class__.__name__}: "
+                      f"{exc}", file=sys.stderr)
         audio_file.writeFromBuffer_error_(buffer, None)
 
     node.installTapOnBus_bufferSize_format_block_(0, 4096, fmt, tap)
@@ -573,6 +686,7 @@ def main() -> None:
             "mic_speaker_mode": "multiple" if use_aec else "single",
             "pid": os.getpid(),
             "silence_popup": SILENCE_POPUP,
+            "silence_auto_stop_seconds": SILENCE_AUTO_STOP_SECONDS,
         },
     }
     atomic_write_json(manifest_path, manifest)
@@ -591,7 +705,8 @@ def main() -> None:
         supervisor.start()
         print("Запис почато. Ctrl+C — стоп.")
         if SILENCE_POPUP:
-            print(f"Silence monitor: popup після {SILENCE_SECONDS:.0f} с тиші обох доріжок.")
+            print(f"Silence monitor: popup після {SILENCE_SECONDS:.0f} с; "
+                  f"auto-stop після {SILENCE_AUTO_STOP_SECONDS:.0f} с тиші.")
         if use_aec:
             record_mic_aec(mic_partial, system_session, monitor)
         else:

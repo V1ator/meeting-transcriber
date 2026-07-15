@@ -60,6 +60,20 @@ class AtomicIOTests(unittest.TestCase):
 
 
 class SilenceMonitorTests(unittest.TestCase):
+    def test_aec_buffer_meter_supports_varlist_style_pointer(self):
+        class Format:
+            commonFormat = 1
+            channelCount = 2
+
+        class Buffer:
+            frameLength = 4
+            format = Format()
+            floatChannelData = [[0.0] * 4, [0.5] * 4]
+
+        self.assertAlmostEqual(
+            record.av_buffer_rms_dbfs(Buffer()), -6.0206, places=3
+        )
+
     def test_aec_buffer_meter_reads_pyobjc_pointer(self):
         import ctypes
 
@@ -102,6 +116,17 @@ class SilenceMonitorTests(unittest.TestCase):
             self.assertEqual(selected, 1)
             self.assertGreater(levels[1], levels[2])
 
+    def test_astats_parser_ignores_overall_level(self):
+        output = """
+[Parsed_astats_0] Channel: 1
+[Parsed_astats_0] RMS level dB: -20.0
+[Parsed_astats_0] Channel: 2
+[Parsed_astats_0] RMS level dB: -6.0
+[Parsed_astats_0] Overall
+[Parsed_astats_0] RMS level dB: -30.0
+"""
+        self.assertEqual(record._parse_astats_levels(output), [-20.0, -6.0])
+
     def test_float_and_integer_pcm_levels(self):
         float_pcm = struct.pack("<4f", 0.5, -0.5, 0.5, -0.5)
         int_pcm = struct.pack("<4h", 16_384, -16_384, 16_384, -16_384)
@@ -143,6 +168,50 @@ class SilenceMonitorTests(unittest.TestCase):
         self.assertFalse(monitor.should_prompt(now=189.9))
         self.assertTrue(monitor.should_prompt(now=190))
 
+    def test_unanswered_popup_auto_stops_after_five_minutes_silence(self):
+        monitor = record.AudioActivityMonitor(
+            silence_seconds=90,
+            min_record_seconds=0,
+            repeat_seconds=600,
+            auto_stop_seconds=300,
+            started_at=0,
+        )
+        monitor.observe_mic(-100, now=0)
+        monitor.observe_system(-100, now=0)
+        monitor.mark_prompted(now=90)
+        monitor.mark_unanswered(now=120)
+        self.assertFalse(monitor.should_auto_stop(now=299.9))
+        self.assertTrue(monitor.should_auto_stop(now=300))
+
+    def test_activity_cancels_scheduled_auto_stop(self):
+        monitor = record.AudioActivityMonitor(
+            silence_seconds=90,
+            min_record_seconds=0,
+            auto_stop_seconds=300,
+            started_at=0,
+        )
+        monitor.observe_mic(-100, now=0)
+        monitor.observe_system(-100, now=0)
+        monitor.mark_unanswered(now=120)
+        monitor.observe_system(-10, now=250)
+        self.assertFalse(monitor.should_auto_stop(now=400))
+
+    def test_continue_snoozes_popup_for_ten_minutes(self):
+        monitor = record.AudioActivityMonitor(
+            silence_seconds=90,
+            min_record_seconds=0,
+            repeat_seconds=600,
+            auto_stop_seconds=300,
+            started_at=0,
+        )
+        monitor.observe_mic(-100, now=0)
+        monitor.observe_system(-100, now=0)
+        monitor.mark_prompted(now=90)
+        monitor.mark_continued(now=120)
+        self.assertFalse(monitor.should_prompt(now=719.9))
+        self.assertTrue(monitor.should_prompt(now=720))
+        self.assertFalse(monitor.should_auto_stop(now=720))
+
     def test_snapshot_uses_json_safe_value_before_first_buffer(self):
         monitor = record.AudioActivityMonitor(started_at=0)
         self.assertIsNone(monitor.snapshot()["last_mic_dbfs"])
@@ -156,14 +225,18 @@ class SilenceMonitorTests(unittest.TestCase):
         )
         with mock.patch.object(record.subprocess, "Popen", return_value=process):
             stop_event = mock.Mock(is_set=lambda: False)
-            self.assertTrue(record.ask_finish_after_silence(stop_event))
+            self.assertEqual(
+                record.ask_finish_after_silence(stop_event), "finish"
+            )
 
         process.stdout = io.StringIO(
             "button returned:Завершити запис, gave up:true\n"
         )
         with mock.patch.object(record.subprocess, "Popen", return_value=process):
             stop_event = mock.Mock(is_set=lambda: False)
-            self.assertFalse(record.ask_finish_after_silence(stop_event))
+            self.assertEqual(
+                record.ask_finish_after_silence(stop_event), "timeout"
+            )
 
 
 class MicrophoneModeTests(unittest.TestCase):
