@@ -47,7 +47,7 @@ OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1")
 OLLAMA_NUM_CTX = int(os.environ.get("OLLAMA_NUM_CTX", "16384"))
 OLLAMA_THINK = os.environ.get("OLLAMA_THINK", "false").lower() == "true"
 ALLOW_REMOTE_OLLAMA = os.environ.get("ALLOW_REMOTE_OLLAMA", "false").lower() == "true"
-ROTATE_DAYS = int(os.environ.get("ROTATE_DAYS", "14"))
+ROTATE_DAYS = int(os.environ.get("ROTATE_DAYS", "5"))
 MIN_SESSION_SECONDS = float(os.environ.get("MIN_SESSION_SECONDS", "10"))
 SILENT_RECORDING_PEAK_DBFS = float(
     os.environ.get("SILENT_RECORDING_PEAK_DBFS", "-70")
@@ -580,9 +580,16 @@ def rotate_old_wavs() -> None:
     cutoff = time.time() - ROTATE_DAYS * 86400
     for wav in RECORDINGS.glob("*.wav"):
         session = wav.name.removesuffix("_mic.wav").removesuffix("_sys.wav")
-        manifest = read_json(manifest_path(session), {}) or {}
+        session_manifest = manifest_path(session)
+        manifest = read_json(session_manifest, {}) or {}
+        complete = manifest.get("status") == "complete"
+        legacy_complete = (
+            not session_manifest.exists()
+            and (TRANSCRIPTS / f"{session}.md").exists()
+            and note_for(session) is not None
+        )
         if (wav.stat().st_mtime < cutoff and note_for(session)
-                and manifest.get("status") == "complete"):
+                and (complete or legacy_complete)):
             wav.unlink()
             log(f"Ротація: видалено {wav.name}")
 

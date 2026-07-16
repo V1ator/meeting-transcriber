@@ -518,6 +518,43 @@ class WatcherStateTests(unittest.TestCase):
                 pipeline_utils.atomic_write_json(manifest, {"status": "recorded"})
                 self.assertEqual(watcher.find_ready_sessions(), [session])
 
+    def test_rotation_handles_complete_and_legacy_sessions_safely(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            recordings = root / "recordings"
+            transcripts = root / "transcripts"
+            notes = root / "notes"
+            for path in (recordings, transcripts, notes):
+                path.mkdir()
+            now = 2_000_000_000.0
+            old = now - 6 * 86400
+
+            for session in ("legacy", "complete", "failed"):
+                for track in ("mic", "sys"):
+                    wav = recordings / f"{session}_{track}.wav"
+                    wav.write_bytes(b"audio")
+                    watcher.os.utime(wav, (old, old))
+                (notes / f"{session} — Note.md").write_text("note")
+                (transcripts / f"{session}.md").write_text("transcript")
+
+            pipeline_utils.atomic_write_json(
+                recordings / "complete.json", {"status": "complete"}
+            )
+            pipeline_utils.atomic_write_json(
+                recordings / "failed.json", {"status": "recording_failed"}
+            )
+
+            with mock.patch.object(watcher, "RECORDINGS", recordings), \
+                 mock.patch.object(watcher, "TRANSCRIPTS", transcripts), \
+                 mock.patch.object(watcher, "NOTES", notes), \
+                 mock.patch.object(watcher, "ROTATE_DAYS", 5), \
+                 mock.patch.object(watcher.time, "time", return_value=now):
+                watcher.rotate_old_wavs()
+
+            self.assertFalse(any(recordings.glob("legacy_*.wav")))
+            self.assertFalse(any(recordings.glob("complete_*.wav")))
+            self.assertEqual(len(list(recordings.glob("failed_*.wav"))), 2)
+
     def test_summary_structure_validation(self):
         complete = "\n".join(watcher.REQUIRED_HEADINGS)
         self.assertTrue(watcher._valid_summary(complete))

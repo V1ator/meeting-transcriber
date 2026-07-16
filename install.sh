@@ -112,6 +112,8 @@ mkdir -p recordings transcripts notes failed logs
 # достатньо перезапустити install.sh.
 step "Фонові сервіси (launchd)"
 PROJ="$(pwd)"
+SERVICE_LOG_DIR="$HOME/Library/Logs/MeetingTranscriber"
+mkdir -p "$SERVICE_LOG_DIR"
 
 make_plist() {  # $1 = label, далі — ProgramArguments
     local LABEL=$1; shift
@@ -129,8 +131,8 @@ make_plist() {  # $1 = label, далі — ProgramArguments
 $(printf '%b' "$ARGS")    </array>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><true/>
-    <key>StandardOutPath</key><string>$PROJ/logs/${LABEL##*.}.log</string>
-    <key>StandardErrorPath</key><string>$PROJ/logs/${LABEL##*.}.log</string>
+    <key>StandardOutPath</key><string>$SERVICE_LOG_DIR/${LABEL##*.}.log</string>
+    <key>StandardErrorPath</key><string>$SERVICE_LOG_DIR/${LABEL##*.}.log</string>
     <key>ProcessType</key><string>Background</string>
     <key>ThrottleInterval</key><integer>30</integer>
 </dict>
@@ -146,10 +148,10 @@ for AGENT in local.meeting-transcriber.watcher local.meeting-transcriber.mic-aut
     launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/$AGENT.plist
 done
 sleep 2
-launchctl list | grep -q meeting-transcriber && ok "watcher запущено (logs/watcher.log)" \
-    || warn "watcher не піднявся — logs/watcher.log"
-launchctl list | grep -q mic-autostart && ok "mic-autostart запущено (logs/mic-autostart.log)" \
-    || warn "mic-autostart не піднявся — logs/mic-autostart.log"
+launchctl list | grep -q meeting-transcriber && ok "watcher запущено ($SERVICE_LOG_DIR/watcher.log)" \
+    || warn "watcher не піднявся — $SERVICE_LOG_DIR/watcher.log"
+launchctl list | grep -q mic-autostart && ok "mic-autostart запущено ($SERVICE_LOG_DIR/mic-autostart.log)" \
+    || warn "mic-autostart не піднявся — $SERVICE_LOG_DIR/mic-autostart.log"
 
 # ---------- Підсумок ----------
 echo "\n════════════════════════════════════════"
