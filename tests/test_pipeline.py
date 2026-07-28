@@ -5,7 +5,6 @@ import json
 import struct
 import tempfile
 import unittest
-import warnings
 from pathlib import Path
 from unittest import mock
 
@@ -60,73 +59,6 @@ class AtomicIOTests(unittest.TestCase):
 
 
 class SilenceMonitorTests(unittest.TestCase):
-    def test_aec_buffer_meter_supports_varlist_style_pointer(self):
-        class Format:
-            commonFormat = 1
-            channelCount = 2
-
-        class Buffer:
-            frameLength = 4
-            format = Format()
-            floatChannelData = [[0.0] * 4, [0.5] * 4]
-
-        self.assertAlmostEqual(
-            record.av_buffer_rms_dbfs(Buffer()), -6.0206, places=3
-        )
-
-    def test_aec_buffer_meter_reads_pyobjc_pointer(self):
-        import ctypes
-
-        try:
-            import AVFAudio as AV
-        except ImportError:
-            import AVFoundation as AV
-        fmt = AV.AVAudioFormat.alloc().initStandardFormatWithSampleRate_channels_(
-            48_000, 2
-        )
-        buffer = AV.AVAudioPCMBuffer.alloc().initWithPCMFormat_frameCapacity_(fmt, 16)
-        buffer.setFrameLength_(16)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            pointer = buffer.floatChannelData()
-        channels = ctypes.cast(
-            pointer.pointerAsInteger,
-            ctypes.POINTER(ctypes.POINTER(ctypes.c_float)),
-        )
-        for index in range(16):
-            channels[0][index] = 0.0
-            channels[1][index] = 0.5
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            self.assertAlmostEqual(record.av_buffer_rms_dbfs(buffer), -6.0206, places=3)
-
-    def test_aec_finalizer_selects_loudest_file_channel(self):
-        import numpy as np
-        import soundfile as sf
-
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "aec.wav"
-            audio = np.column_stack([
-                np.zeros(16_000, dtype="float32"),
-                np.full(16_000, 0.25, dtype="float32"),
-                np.full(16_000, 0.05, dtype="float32"),
-            ])
-            sf.write(path, audio, 16_000, subtype="FLOAT")
-            selected, levels = record._loudest_file_channel(path)
-            self.assertEqual(selected, 1)
-            self.assertGreater(levels[1], levels[2])
-
-    def test_astats_parser_ignores_overall_level(self):
-        output = """
-[Parsed_astats_0] Channel: 1
-[Parsed_astats_0] RMS level dB: -20.0
-[Parsed_astats_0] Channel: 2
-[Parsed_astats_0] RMS level dB: -6.0
-[Parsed_astats_0] Overall
-[Parsed_astats_0] RMS level dB: -30.0
-"""
-        self.assertEqual(record._parse_astats_levels(output), [-20.0, -6.0])
-
     def test_float_and_integer_pcm_levels(self):
         float_pcm = struct.pack("<4f", 0.5, -0.5, 0.5, -0.5)
         int_pcm = struct.pack("<4h", 16_384, -16_384, 16_384, -16_384)
@@ -269,23 +201,39 @@ class MicrophoneModeTests(unittest.TestCase):
             self.assertFalse(request.exists())
 
     def test_cli_mode_overrides_env_fallback(self):
-        with mock.patch.dict(record.os.environ, {"RECORD_AEC": "true"}):
-            self.assertTrue(record.resolve_aec_mode([]))
-            self.assertFalse(record.resolve_aec_mode(["--raw"]))
-        with mock.patch.dict(record.os.environ, {"RECORD_AEC": "false"}):
-            self.assertFalse(record.resolve_aec_mode([]))
-            self.assertTrue(record.resolve_aec_mode(["--aec"]))
+        with mock.patch.dict(
+            record.os.environ,
+            {"RECORD_MIC_MODE": "multiple", "RECORD_AEC": "false"},
+        ):
+            self.assertEqual(record.resolve_mic_speaker_mode([]), "multiple")
+            self.assertEqual(record.resolve_mic_speaker_mode(["--raw"]), "single")
+        with mock.patch.dict(
+            record.os.environ,
+            {"RECORD_MIC_MODE": "single", "RECORD_AEC": "true"},
+        ):
+            self.assertEqual(record.resolve_mic_speaker_mode([]), "single")
+            self.assertEqual(
+                record.resolve_mic_speaker_mode(["--speakers"]), "multiple"
+            )
+
+    def test_legacy_aec_alias_selects_multiple_without_live_aec(self):
+        with mock.patch.dict(record.os.environ, {}, clear=True):
+            self.assertEqual(
+                record.resolve_mic_speaker_mode(["--aec"]), "multiple"
+            )
+        with mock.patch.dict(record.os.environ, {"RECORD_AEC": "true"}, clear=True):
+            self.assertEqual(record.resolve_mic_speaker_mode([]), "multiple")
 
     def test_conflicting_or_unknown_mode_is_rejected(self):
         with self.assertRaises(ValueError):
-            record.resolve_aec_mode(["--aec", "--raw"])
+            record.resolve_mic_speaker_mode(["--speakers", "--raw"])
         with self.assertRaises(ValueError):
-            record.resolve_aec_mode(["--other"])
+            record.resolve_mic_speaker_mode(["--other"])
 
     def test_start_popup_returns_selected_mode(self):
         cases = {
             "button returned:Навушники, gave up:false": "--raw",
-            "button returned:Динаміки, gave up:false": "--aec",
+            "button returned:Динаміки, gave up:false": "--speakers",
             "button returned:Динаміки, gave up:true": None,
             "button returned:Пропустити, gave up:false": None,
         }

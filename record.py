@@ -4,23 +4,20 @@
 from __future__ import annotations
 
 import array
-import ctypes
 import datetime
 import math
 import os
 import queue
-import re
 import signal
 import subprocess
 import sys
 import threading
 import time
 import uuid
-import warnings
 from pathlib import Path
 from typing import Any
 
-from pipeline_utils import atomic_write_json, audio_info, find_ffmpeg, load_dotenv, utc_now
+from pipeline_utils import atomic_write_json, audio_info, load_dotenv, utc_now
 
 BASE = Path(__file__).parent
 load_dotenv(BASE / ".env")
@@ -153,63 +150,6 @@ def ndarray_rms_dbfs(indata) -> float:
     selected = samples[::stride]
     rms = float((selected.dot(selected) / selected.size) ** 0.5)
     return _dbfs(rms)
-
-
-def av_buffer_rms_dbfs(buffer) -> float:
-    """Максимальний RMS усіх Voice Processing channels з AVAudioPCMBuffer."""
-    def value(obj, name):
-        attribute = getattr(obj, name)
-        return attribute() if callable(attribute) else attribute
-
-    frame_count = int(value(buffer, "frameLength"))
-    if frame_count <= 0:
-        return float("-inf")
-    stride = max(1, frame_count // 1024)
-    fmt = value(buffer, "format")
-    common_format = int(value(fmt, "commonFormat"))
-    channel_count = int(value(fmt, "channelCount"))
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", message=r"PyObjCPointer created:.*")
-        if common_format == 1:
-            pointer = value(buffer, "floatChannelData")
-            sample_type, scale = ctypes.c_float, 1.0
-        elif common_format == 3:
-            pointer = value(buffer, "int16ChannelData")
-            sample_type, scale = ctypes.c_int16, 32768.0
-        elif common_format == 4:
-            pointer = value(buffer, "int32ChannelData")
-            sample_type, scale = ctypes.c_int32, 2147483648.0
-        else:
-            return float("-inf")
-    if pointer is None:
-        return float("-inf")
-    channels = None
-    pointer_address = getattr(pointer, "pointerAsInteger", None)
-    if pointer_address is not None:
-        pointer_address = (pointer_address() if callable(pointer_address)
-                           else pointer_address)
-        channels = ctypes.cast(
-            pointer_address,
-            ctypes.POINTER(ctypes.POINTER(sample_type)),
-        )
-    loudest = float("-inf")
-    for channel_index in range(channel_count):
-        # Callback buffers можуть повертати objc.varlist, тоді як створені
-        # вручну buffers повертають PyObjCPointer. Підтримуємо обидва API.
-        try:
-            channel = pointer[channel_index]
-            _ = channel[0]
-        except (AttributeError, IndexError, TypeError):
-            if channels is None:
-                raise TypeError("Невідомий тип AVAudioPCMBuffer channel pointer")
-            channel = channels[channel_index]
-        squares = [
-            (float(channel[index]) / scale) ** 2
-            for index in range(0, frame_count, stride)
-        ]
-        if squares:
-            loudest = max(loudest, _dbfs(math.sqrt(sum(squares) / len(squares))))
-    return loudest
 
 
 class AudioActivityMonitor:
@@ -496,145 +436,6 @@ def record_mic_raw(mic_path: Path, system_session,
                 output.write(audio_q.get_nowait())
 
 
-def _parse_astats_levels(output: str) -> list[float]:
-    """Витягає per-channel RMS із ffmpeg astats (не Overall)."""
-    levels: dict[int, float] = {}
-    channel: int | None = None
-    for line in output.splitlines():
-        match = re.search(r"Channel:\s+(\d+)", line)
-        if match:
-            channel = int(match.group(1)) - 1
-            continue
-        if "Overall" in line:
-            channel = None
-            continue
-        match = re.search(r"RMS level dB:\s+([-+\w.]+)", line)
-        if match and channel is not None:
-            try:
-                levels[channel] = float(match.group(1))
-            except ValueError:
-                levels[channel] = float("-inf")
-    if not levels:
-        raise RuntimeError("ffmpeg не повернув RMS рівні AEC-каналів")
-    return [levels.get(index, float("-inf"))
-            for index in range(max(levels) + 1)]
-
-
-def _loudest_file_channel(path: Path) -> tuple[int, list[float]]:
-    """Обирає найгучніший канал, зокрема у BW64-файлах понад 4 GB."""
-    result = subprocess.run(
-        [find_ffmpeg(), "-hide_banner", "-nostats", "-i", str(path),
-         "-af", "astats=metadata=0:reset=0", "-f", "null", "-"],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    levels = _parse_astats_levels(result.stderr)
-    return max(range(len(levels)), key=levels.__getitem__), levels
-
-
-def to_mono(path: Path) -> dict[str, Any]:
-    """Обирає найгучніший Voice Processing channel і зводить його в mono."""
-    ffmpeg = find_ffmpeg()
-    tmp = path.with_name(f".{path.stem}.mono.wav")
-    try:
-        selected, levels = _loudest_file_channel(path)
-        subprocess.run(
-            [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(path),
-             "-af", f"pan=mono|c0=c{selected}", "-c:a", "pcm_s16le", str(tmp)],
-            check=True,
-            capture_output=True,
-        )
-        tmp.replace(path)
-        print(f"[mic] зведено в моно (канал {selected}, {levels[selected]:.1f} dBFS)")
-        return {
-            "aec_selected_channel": selected,
-            "aec_channel_levels_dbfs": [round(level, 2) for level in levels],
-        }
-    except subprocess.CalledProcessError as exc:
-        tmp.unlink(missing_ok=True)
-        detail = exc.stderr
-        if isinstance(detail, bytes):
-            detail = detail.decode(errors="replace")
-        detail = (detail or "")[-300:]
-        raise RuntimeError(f"Не вдалося звести AEC WAV у моно: {detail}") from exc
-
-
-def _res_err(result):
-    if isinstance(result, tuple):
-        return result[0], (result[1] if len(result) > 1 else None)
-    return result, None
-
-
-def record_mic_aec(mic_path: Path, system_session,
-                   monitor: AudioActivityMonitor) -> None:
-    from Foundation import NSURL
-    try:
-        import AVFAudio as AV
-    except ImportError:
-        import AVFoundation as AV
-
-    engine = AV.AVAudioEngine.alloc().init()
-    node = engine.inputNode()
-    ok, err = _res_err(node.setVoiceProcessingEnabled_error_(True, None))
-    if not ok:
-        raise RuntimeError(f"Voice Processing не ввімкнувся: {err}")
-
-    def apply_min_ducking(when: str) -> None:
-        try:
-            config = AV.AVAudioVoiceProcessingOtherAudioDuckingConfiguration(
-                enableAdvancedDucking=False,
-                duckingLevel=AV.AVAudioVoiceProcessingOtherAudioDuckingLevelMin,
-            )
-            node.setVoiceProcessingOtherAudioDuckingConfiguration_(config)
-            print(f"[mic] ducking → мінімум ({when})")
-        except Exception as exc:
-            print(f"[mic] ⚠️ ducking не налаштувався ({when}, "
-                  f"{exc.__class__.__name__})", file=sys.stderr)
-
-    apply_min_ducking("до старту")
-    fmt = node.outputFormatForBus_(0)
-    url = NSURL.fileURLWithPath_(str(mic_path))
-    audio_file, err = _res_err(
-        AV.AVAudioFile.alloc().initForWriting_settings_error_(url, fmt.settings(), None)
-    )
-    if audio_file is None:
-        raise RuntimeError(f"Не створився вихідний файл: {err}")
-
-    meter_error_reported = False
-
-    def tap(buffer, when):
-        global MIC_FIRST_FRAME_AT
-        nonlocal meter_error_reported
-        MIC_FIRST_FRAME_AT = MIC_FIRST_FRAME_AT or time.monotonic()
-        try:
-            monitor.observe_mic(av_buffer_rms_dbfs(buffer))
-        except Exception as exc:
-            if not meter_error_reported:
-                meter_error_reported = True
-                print(f"[silence] AEC meter error: {exc.__class__.__name__}: "
-                      f"{exc}", file=sys.stderr)
-        audio_file.writeFromBuffer_error_(buffer, None)
-
-    node.installTapOnBus_bufferSize_format_block_(0, 4096, fmt, tap)
-    ok, err = _res_err(engine.startAndReturnError_(None))
-    if not ok:
-        raise RuntimeError(f"AVAudioEngine не стартував: {err}")
-    apply_min_ducking("після старту")
-    print(f"[mic] AEC активний (формат: {int(fmt.sampleRate())} Hz, "
-          f"{int(fmt.channelCount())} ch)")
-
-    try:
-        while not STOP:
-            time.sleep(0.5)
-            if not system_session.is_recording:
-                raise RuntimeError("Втрачено системну доріжку під час запису")
-    finally:
-        node.removeTapOnBus_(0)
-        engine.stop()
-        del audio_file
-
-
 def _cleanup_own_pid() -> None:
     try:
         if int(PID_FILE.read_text().strip()) == os.getpid():
@@ -643,24 +444,48 @@ def _cleanup_own_pid() -> None:
         pass
 
 
-def resolve_aec_mode(argv: list[str] | None = None) -> bool:
-    """CLI mode має пріоритет над fallback RECORD_AEC із .env."""
+def resolve_mic_speaker_mode(argv: list[str] | None = None) -> str:
+    """Повертає single/multiple; обидва профілі використовують Raw capture."""
     args = sys.argv[1:] if argv is None else argv
-    if "--aec" in args and "--raw" in args:
-        raise ValueError("Оберіть лише один режим мікрофона: --aec або --raw")
-    unknown = [arg for arg in args if arg not in {"--aec", "--raw"}]
+    allowed = {"--raw", "--speakers", "--aec"}
+    unknown = [arg for arg in args if arg not in allowed]
     if unknown:
         raise ValueError(f"Невідомі аргументи: {' '.join(unknown)}")
-    if "--aec" in args:
-        return True
+    selected = [arg for arg in args if arg in allowed]
+    if len(selected) > 1:
+        raise ValueError("Оберіть лише один режим: --raw або --speakers")
     if "--raw" in args:
-        return False
-    return os.environ.get("RECORD_AEC", "false").lower() == "true"
+        return "single"
+    if "--speakers" in args or "--aec" in args:
+        return "multiple"
+
+    configured = os.environ.get("RECORD_MIC_MODE", "").strip().lower()
+    aliases = {
+        "single": "single",
+        "headphones": "single",
+        "raw": "single",
+        "multiple": "multiple",
+        "speakers": "multiple",
+    }
+    if configured:
+        if configured not in aliases:
+            raise ValueError(
+                "RECORD_MIC_MODE має бути single/headphones або multiple/speakers"
+            )
+        return aliases[configured]
+    # Міграція старих локальних .env: RECORD_AEC більше не вмикає live-AEC,
+    # а лише обирає профіль кількох людей.
+    return (
+        "multiple"
+        if os.environ.get("RECORD_AEC", "false").lower() == "true"
+        else "single"
+    )
 
 
 def main() -> None:
     global STOP
-    use_aec = resolve_aec_mode()
+    mic_speaker_mode = resolve_mic_speaker_mode()
+    mic_diarization = mic_speaker_mode == "multiple"
     ensure_microphone_permission()
     RECORDINGS_DIR.mkdir(exist_ok=True)
     session = _session_id()
@@ -681,9 +506,10 @@ def main() -> None:
         "created_at": utc_now(),
         "started_at": started_wall.isoformat(timespec="seconds"),
         "recording": {
-            "aec": use_aec,
-            "mic_diarization": use_aec,
-            "mic_speaker_mode": "multiple" if use_aec else "single",
+            "capture_mode": "raw",
+            "aec": False,
+            "mic_diarization": mic_diarization,
+            "mic_speaker_mode": mic_speaker_mode,
             "pid": os.getpid(),
             "silence_popup": SILENCE_POPUP,
             "silence_auto_stop_seconds": SILENCE_AUTO_STOP_SECONDS,
@@ -691,7 +517,8 @@ def main() -> None:
     }
     atomic_write_json(manifest_path, manifest)
 
-    print(f"Сесія: {session} (мікрофон: {'AEC' if use_aec else 'сирий'})")
+    profile = "Динаміки / кілька людей" if mic_diarization else "Навушники / один спікер"
+    print(f"Сесія: {session} (мікрофон: Raw; профіль: {profile})")
     print(f"  мікрофон  -> {mic_final}")
     print(f"  системний -> {sys_final}")
     signal.signal(signal.SIGINT, _on_signal)
@@ -707,11 +534,7 @@ def main() -> None:
         if SILENCE_POPUP:
             print(f"Silence monitor: popup після {SILENCE_SECONDS:.0f} с; "
                   f"auto-stop після {SILENCE_AUTO_STOP_SECONDS:.0f} с тиші.")
-        if use_aec:
-            record_mic_aec(mic_partial, system_session, monitor)
-        else:
-            print("Нагадування: без навушників використовуйте --aec.")
-            record_mic_raw(mic_partial, system_session, monitor)
+        record_mic_raw(mic_partial, system_session, monitor)
     except BaseException as exc:
         error = exc
     finally:
@@ -729,11 +552,6 @@ def main() -> None:
     try:
         if error is not None:
             raise error
-        if use_aec:
-            # System tap уже закритий: конвертація більше не додає sync drift.
-            aec_quality = to_mono(mic_partial)
-        else:
-            aec_quality = {}
         mic_meta = audio_info(mic_partial)
         sys_meta = audio_info(sys_partial)
         if min(mic_meta["duration"], sys_meta["duration"]) <= 0.1:
@@ -760,7 +578,6 @@ def main() -> None:
             },
             "quality": {
                 "mic_dropped_blocks": MIC_DROPPED_BLOCKS,
-                **aec_quality,
                 **monitor.snapshot(),
             },
         })

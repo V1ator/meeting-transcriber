@@ -133,7 +133,7 @@ def ask_to_record() -> str | None:
     if "button returned:Навушники" in result:
         return "--raw"
     if "button returned:Динаміки" in result:
-        return "--aec"
+        return "--speakers"
     return None
 
 
@@ -168,7 +168,11 @@ def main() -> None:
                 log("мікрофон активний → питаю")
                 mode = ask_to_record()
                 if mode:
-                    label = "AEC/динаміки" if mode == "--aec" else "Raw/навушники"
+                    label = (
+                        "Raw/динаміки + діаризація"
+                        if mode == "--speakers"
+                        else "Raw/навушники"
+                    )
                     log(f"згода → старт запису ({label})")
                     subprocess.run([str(TOGGLE), mode], check=False)
                 else:

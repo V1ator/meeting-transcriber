@@ -19,10 +19,12 @@ notify() {
     osascript -e "display notification \"$1\" with title \"Meeting Transcriber\""
 }
 
-if [ "$#" -gt 1 ] || { [ -n "$MODE" ] && [ "$MODE" != "--aec" ] && [ "$MODE" != "--raw" ]; }; then
+if [ "$#" -gt 1 ] || { [ -n "$MODE" ] && [ "$MODE" != "--speakers" ] && [ "$MODE" != "--aec" ] && [ "$MODE" != "--raw" ]; }; then
     notify "Невідомий режим запису"
     exit 2
 fi
+# Старий --aec лишається сумісним псевдонімом профілю «Динаміки», без live-AEC.
+[ "$MODE" = "--aec" ] && MODE="--speakers"
 
 choose_mode() {
     local result
@@ -30,7 +32,7 @@ choose_mode() {
     [ -n "$result" ] || return 1
     [[ "$result" == *"gave up:true"* ]] && return 1
     [[ "$result" == *"button returned:Навушники"* ]] && { echo "--raw"; return 0; }
-    [[ "$result" == *"button returned:Динаміки"* ]] && { echo "--aec"; return 0; }
+    [[ "$result" == *"button returned:Динаміки"* ]] && { echo "--speakers"; return 0; }
     return 1
 }
 
@@ -72,8 +74,8 @@ else
     sleep 1
     if kill -0 "$PID" 2>/dev/null; then
         (umask 077; printf '%s\n' "$PID" > "$PID_FILE")
-        if [ "$MODE" = "--aec" ]; then
-            notify "🔴 Йде запис — режим Динаміки (AEC)"
+        if [ "$MODE" = "--speakers" ]; then
+            notify "🔴 Йде запис — Динаміки (Raw + діаризація)"
         else
             notify "🔴 Йде запис — режим Навушники (Raw)"
         fi
