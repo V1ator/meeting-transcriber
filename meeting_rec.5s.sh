@@ -3,12 +3,21 @@
 # «.5s» у назві = оновлення кожні 5 секунд (конвенція SwiftBar).
 # Встановлення: див. README.md (символьне посилання в папку плагінів SwiftBar).
 
-# Шлях до проекту визначається через symlink — працює після перенесення папки
-DIR="$(dirname "$(readlink -f "$0")")"
+# zsh-модифікатор :A розкриває symlink і працює у штатному macOS без GNU readlink.
+DIR="${0:A:h}"
 PID_FILE="$DIR/.record.pid"
 REQUEST="$DIR/request_record.sh"
 
-if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+recording_pid() {
+    [ -f "$PID_FILE" ] || return 1
+    local pid="$(tr -cd '0-9' < "$PID_FILE")"
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || return 1
+    local command="$(ps -p "$pid" -o command= 2>/dev/null)"
+    [[ "$command" == *"record.py"* ]] || return 1
+    echo "$pid"
+}
+
+if PID="$(recording_pid)"; then
     # скільки триває запис (від часу створення pid-файлу)
     START=$(stat -f %m "$PID_FILE")
     ELAPSED=$(( $(date +%s) - START ))

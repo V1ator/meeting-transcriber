@@ -1,0 +1,180 @@
+#meeting-transcriber-widget,
+.meeting-transcriber-hide-native-captions
+  [data-meeting-transcriber-caption-region],
+.meeting-transcriber-hide-native-captions
+  [data-meeting-transcriber-caption-host],
+.meeting-transcriber-hide-native-captions
+  [data-meeting-transcriber-caption-shell],
+.meeting-transcriber-hide-native-captions
+  [role="region"].vNKgIf.UDinHf {
+  transition: opacity 120ms ease;
+}
+
+.meeting-transcriber-hide-native-captions
+  [data-meeting-transcriber-caption-region],
+.meeting-transcriber-hide-native-captions
+  [data-meeting-transcriber-caption-host],
+.meeting-transcriber-hide-native-captions
+  [data-meeting-transcriber-caption-shell],
+.meeting-transcriber-hide-native-captions
+  [role="region"].vNKgIf.UDinHf {
+  opacity: 0 !important;
+  visibility: hidden !important;
+  background: transparent !important;
+  box-shadow: none !important;
+  pointer-events: none !important;
+}
+
+.meeting-transcriber-hide-native-captions
+  [data-meeting-transcriber-caption-shell] {
+  min-height: 0 !important;
+  height: 0 !important;
+  max-height: 0 !important;
+  margin-block: 0 !important;
+  padding-block: 0 !important;
+  border: 0 !important;
+  overflow: hidden !important;
+}
+
+#meeting-transcriber-widget {
+  --mt-bg: #17191d;
+  --mt-border: rgba(255, 255, 255, 0.12);
+  --mt-text: #f7f7f8;
+  --mt-muted: #aeb3bd;
+  position: fixed;
+  z-index: 2147483647;
+  top: 80px;
+  right: 16px;
+  width: 320px;
+  color: var(--mt-text);
+  background: var(--mt-bg);
+  border: 1px solid var(--mt-border);
+  border-radius: 14px;
+  box-shadow: 0 14px 44px rgba(0, 0, 0, 0.34);
+  overflow: hidden;
+  font: 13px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+#meeting-transcriber-widget * {
+  box-sizing: border-box;
+}
+
+#meeting-transcriber-widget header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 11px 12px;
+  border-bottom: 1px solid var(--mt-border);
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+}
+
+#meeting-transcriber-widget.dragging header {
+  cursor: grabbing;
+}
+
+#meeting-transcriber-widget header div {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 650;
+}
+
+#meeting-transcriber-widget header i {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #f2b84b;
+}
+
+#meeting-transcriber-widget[data-status="capturing"] header i,
+#meeting-transcriber-widget[data-status="capturing-rtc"] header i {
+  background: #42cf83;
+  box-shadow: 0 0 0 4px rgba(66, 207, 131, 0.13);
+}
+
+#meeting-transcriber-widget[data-status="paused"] header i {
+  background: #9da3ad;
+}
+
+#meeting-transcriber-widget button {
+  appearance: none;
+  color: var(--mt-text);
+  background: #292c32;
+  border: 1px solid var(--mt-border);
+  border-radius: 8px;
+  padding: 6px 9px;
+  cursor: pointer;
+  font: inherit;
+  touch-action: auto;
+}
+
+#meeting-transcriber-widget button:hover {
+  background: #353941;
+}
+
+#meeting-transcriber-widget header button {
+  width: 28px;
+  padding: 3px;
+  font-size: 17px;
+}
+
+#meeting-transcriber-widget section {
+  padding: 11px 12px 12px;
+}
+
+#meeting-transcriber-widget.collapsed section {
+  display: none;
+}
+
+#meeting-transcriber-widget.collapsed header {
+  border-bottom: 0;
+}
+
+#meeting-transcriber-widget .mt-meta {
+  display: flex;
+  justify-content: space-between;
+  color: var(--mt-muted);
+  margin-bottom: 9px;
+  font-size: 11px;
+}
+
+#meeting-transcriber-widget .mt-preview {
+  max-height: 190px;
+  overflow: auto;
+}
+
+#meeting-transcriber-widget .mt-preview:empty::before {
+  content: "Очікую на українські live captions…";
+  display: block;
+  color: var(--mt-muted);
+  padding: 18px 4px;
+  text-align: center;
+}
+
+#meeting-transcriber-widget .mt-preview div {
+  display: grid;
+  gap: 2px;
+  padding: 7px 2px;
+  border-top: 1px solid rgba(255, 255, 255, 0.07);
+}
+
+#meeting-transcriber-widget .mt-preview strong {
+  color: #a9c7ff;
+  font-size: 11px;
+}
+
+#meeting-transcriber-widget .mt-preview span {
+  overflow-wrap: anywhere;
+}
+
+#meeting-transcriber-widget .mt-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+#meeting-transcriber-widget .mt-actions button {
+  flex: 1;
+}

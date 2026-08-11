@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import array
 import datetime
+import fcntl
 import math
 import os
 import queue
@@ -17,12 +18,22 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from pipeline_utils import atomic_write_json, audio_info, load_dotenv, utc_now
+from pipeline_utils import (
+    atomic_write_json,
+    audio_info,
+    ensure_private_dir,
+    load_dotenv,
+    utc_now,
+)
 
 BASE = Path(__file__).parent
 load_dotenv(BASE / ".env")
 RECORDINGS_DIR = BASE / "recordings"
 PID_FILE = BASE / ".record.pid"
+PROCESS_LOCK_PATH = BASE / ".record.process.lock"
+AUDIO_PIPELINE_ENABLED = (
+    os.environ.get("AUDIO_PIPELINE_ENABLED", "true").lower() == "true"
+)
 SAMPLE_RATE = 48_000
 CHANNELS = 1
 MAX_RECORD_SECONDS = int(os.environ.get("MAX_RECORD_SECONDS", "21600"))
@@ -44,6 +55,19 @@ STOP_REASON: str | None = None
 STOP_REQUESTED_AT: float | None = None
 MIC_FIRST_FRAME_AT: float | None = None
 MIC_DROPPED_BLOCKS = 0
+
+
+def acquire_process_lock():
+    """Hold a non-blocking process lock for the full recording lifetime."""
+    fd = os.open(PROCESS_LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o600)
+    os.fchmod(fd, 0o600)
+    lock = os.fdopen(fd, "r+")
+    try:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock.close()
+        raise RuntimeError("RECORDING_ALREADY_RUNNING") from None
+    return lock
 
 
 def _request_stop(reason: str) -> None:
@@ -484,10 +508,16 @@ def resolve_mic_speaker_mode(argv: list[str] | None = None) -> str:
 
 def main() -> None:
     global STOP
+    if not AUDIO_PIPELINE_ENABLED:
+        raise SystemExit(
+            "AUDIO_MODULE_DISABLED: модуль audio вимкнено; "
+            "увімкніть його командою `.venv/bin/python3 modules.py enable audio`"
+        )
+    process_lock = acquire_process_lock()
     mic_speaker_mode = resolve_mic_speaker_mode()
     mic_diarization = mic_speaker_mode == "multiple"
     ensure_microphone_permission()
-    RECORDINGS_DIR.mkdir(exist_ok=True)
+    ensure_private_dir(RECORDINGS_DIR)
     session = _session_id()
     mic_final = RECORDINGS_DIR / f"{session}_mic.wav"
     sys_final = RECORDINGS_DIR / f"{session}_sys.wav"
@@ -601,6 +631,7 @@ def main() -> None:
         raise
     finally:
         _cleanup_own_pid()
+        process_lock.close()
 
 
 if __name__ == "__main__":

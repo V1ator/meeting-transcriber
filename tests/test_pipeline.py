@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import io
 import json
 import struct
@@ -16,6 +17,23 @@ import watch_and_process as watcher
 
 
 class AtomicIOTests(unittest.TestCase):
+    def test_private_directory_helper_repairs_permissions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "private"
+            target.mkdir(mode=0o755)
+            pipeline_utils.ensure_private_dir(target)
+            self.assertEqual(target.stat().st_mode & 0o777, 0o700)
+
+    def test_private_directory_helper_rejects_symlink(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "target"
+            target.mkdir()
+            link = root / "private"
+            link.symlink_to(target, target_is_directory=True)
+            with self.assertRaisesRegex(RuntimeError, "symlink"):
+                pipeline_utils.ensure_private_dir(link)
+
     def test_atomic_text_and_json(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -37,6 +55,7 @@ class AtomicIOTests(unittest.TestCase):
             sf.write(source, np.zeros((48_000, 2), dtype="float32"), 48_000)
             pipeline_utils.normalized_audio(source, target)
             first_mtime = target.stat().st_mtime_ns
+            self.assertEqual(target.parent.stat().st_mode & 0o777, 0o700)
             info = pipeline_utils.audio_info(target)
             self.assertEqual(info["channels"], 1)
             self.assertEqual(info["sample_rate"], 16_000)
@@ -56,6 +75,25 @@ class AtomicIOTests(unittest.TestCase):
             self.assertAlmostEqual(
                 pipeline_utils.audio_signal_info(signal)["rms_dbfs"], -6.02, places=1
             )
+
+    def test_source_hash_is_reused_when_size_and_mtime_match(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, cache = root / "audio.wav", root / "cache.json"
+            source.write_bytes(b"unchanged audio")
+            cheap = pipeline_utils.file_fingerprint(source, with_hash=False)
+            expected = {**cheap, "sha256": "trusted-hash"}
+            pipeline_utils.atomic_write_json(
+                cache, {"_meta": {"source": expected}, "segments": []}
+            )
+            with mock.patch.object(
+                transcribe, "file_fingerprint",
+                wraps=pipeline_utils.file_fingerprint,
+            ) as fingerprint:
+                self.assertEqual(
+                    transcribe._source_fingerprint(source, cache), expected
+                )
+            fingerprint.assert_called_once_with(source, with_hash=False)
 
 
 class SilenceMonitorTests(unittest.TestCase):
@@ -172,6 +210,34 @@ class SilenceMonitorTests(unittest.TestCase):
 
 
 class MicrophoneModeTests(unittest.TestCase):
+    def test_recording_process_lock_rejects_second_recorder(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            record, "PROCESS_LOCK_PATH", Path(directory) / "record.lock"
+        ):
+            first = record.acquire_process_lock()
+            try:
+                with self.assertRaisesRegex(RuntimeError, "RECORDING_ALREADY_RUNNING"):
+                    record.acquire_process_lock()
+            finally:
+                first.close()
+
+    def test_paused_auto_start_keeps_manual_queue_without_polling_microphone(self):
+        with (
+            mock.patch.object(mic_watch, "MIC_AUTO_START", False),
+            mock.patch.object(mic_watch, "consume_control_requests", return_value=0)
+            as consume,
+            mock.patch.object(mic_watch, "mic_in_use") as mic_in_use,
+            mock.patch.object(mic_watch, "ask_to_record") as ask_to_record,
+            mock.patch.object(
+                mic_watch.time, "sleep", side_effect=KeyboardInterrupt
+            ),
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                mic_watch.main()
+        consume.assert_called_once_with()
+        mic_in_use.assert_not_called()
+        ask_to_record.assert_not_called()
+
     def test_control_queue_executes_only_known_requests(self):
         with tempfile.TemporaryDirectory() as directory:
             requests = Path(directory)
@@ -374,7 +440,209 @@ class TranscriptionQualityTests(unittest.TestCase):
         self.assertEqual(sync["method"], "recording-manifest")
 
 
+class MeetingNoteMetadataTests(unittest.TestCase):
+    def test_uses_explicit_meet_metadata_and_all_participants(self):
+        transcript = """# Weekly sync
+
+- **Час початку:** 2026-07-30 10:30:40 CEST
+- **Назва зустрічі:** Analytics Weekly
+
+**Учасники:**
+- Інтерв’юер
+- Анна
+- Марія
+
+## Транскрипт
+
+[10:30:40] Інтерв’юер: Привіт
+"""
+        metadata = watcher._meeting_note_metadata(
+            "2026-07-30_10-30-40_meet-abc-defg-hij",
+            transcript,
+            "Згенерована назва",
+        )
+        self.assertEqual(metadata, (
+            "2026-07-30",
+            "10:30:40 CEST",
+            "Analytics Weekly",
+            ["Інтерв’юер", "Анна", "Марія"],
+        ))
+
+    def test_falls_back_to_session_title_and_unique_speakers(self):
+        transcript = """# Транскрипт
+
+[14:32] SPEAKER_00: Перша репліка
+[14:33] SPEAKER_01: Друга репліка
+[14:34] SPEAKER_00: Ще одна репліка
+"""
+        metadata = watcher._meeting_note_metadata(
+            "2026-07-07_1432",
+            transcript,
+            "Планування робіт",
+        )
+        self.assertEqual(metadata, (
+            "2026-07-07",
+            "14:32",
+            "Планування робіт",
+            ["SPEAKER_00", "SPEAKER_01"],
+        ))
+
+
 class WatcherStateTests(unittest.TestCase):
+    def test_watcher_log_includes_local_date_and_time(self):
+        output = io.StringIO()
+        with mock.patch("sys.stdout", output):
+            watcher.log("операція почалась")
+        self.assertRegex(
+            output.getvalue(),
+            r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] операція почалась\n$",
+        )
+
+    def test_ollama_think_can_be_overridden_for_candidate_flow(self):
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return b'{"response":"ok"}'
+
+        with mock.patch.object(watcher, "OLLAMA_THINK", False), \
+             mock.patch.object(
+                 watcher.urllib.request, "urlopen", return_value=Response()
+             ) as urlopen:
+            self.assertEqual(
+                watcher.ollama_generate("prompt", think=True, num_predict=1234),
+                "ok",
+            )
+        payload = json.loads(urlopen.call_args.args[0].data)
+        self.assertTrue(payload["think"])
+        self.assertEqual(payload["options"]["num_predict"], 1234)
+
+    def test_candidate_reasoning_is_reserved_for_final_assessment(self):
+        with mock.patch.object(watcher, "CANDIDATE_OLLAMA_THINK", True):
+            self.assertEqual(
+                watcher._candidate_generation_options(
+                    "Ти витягуєш докази з транскрипту"
+                ),
+                (1200, False),
+            )
+            self.assertEqual(
+                watcher._candidate_generation_options(
+                    "Ти неупереджений hiring assessor"
+                ),
+                (6144, True),
+            )
+            self.assertEqual(
+                watcher._candidate_generation_options(
+                    "Ти форматуєш фінальний hiring report"
+                ),
+                (6144, False),
+            )
+
+    def test_candidate_title_routes_to_alternative_flow(self):
+        transcript = """# Interview | Jane Doe
+
+- **Назва зустрічі:** Interview | Jane Doe
+
+**Учасники:**
+- Interviewer
+- Jane Doe
+
+## Транскрипт
+
+[10:00] Jane Doe: Hello
+"""
+        expected = Path("/tmp/Jane_Doe_2026-07-31.md")
+        with mock.patch.object(watcher, "CANDIDATE_EVALUATION_ENABLED", True), \
+             mock.patch.object(
+                 watcher,
+                 "create_candidate_evaluation_from_transcript",
+                 return_value=expected,
+             ) as create:
+            result = watcher.create_note_from_transcript(
+                "2026-07-31_100000_meet-abc-defg-hij", transcript
+            )
+        self.assertEqual(result, expected)
+        self.assertEqual(create.call_args.kwargs["meeting_title"], "Interview | Jane Doe")
+
+    def test_early_terminated_candidate_skips_llm_and_notion_feedback(self):
+        import candidate_evaluation
+
+        transcript = """# Interview | Jane Doe | Data Analyst
+
+[10:00] Jane Doe: Краще не витрачати час одне одного.
+[10:01] Interviewer: Добре, завершимо тут.
+"""
+        classification = {
+            "meeting_type_label": "Співбесіда",
+            "outcome": "early_terminated",
+            "outcome_label": "Достроково завершена",
+            "reason": "Розмову завершено до основної частини.",
+            "evidence": [{
+                "timestamp": "10:00",
+                "speaker": "Jane Doe",
+                "quote": "Краще не витрачати час одне одного.",
+            }],
+            "candidate_evaluation_eligible": False,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            recordings = root / "recordings"
+            transcripts = root / "transcripts"
+            evaluations = root / "candidate_evaluations"
+            recordings.mkdir()
+            transcripts.mkdir()
+            with mock.patch.object(watcher.project_paths, "RECORDINGS", recordings), \
+                    mock.patch.object(watcher.project_paths, "TRANSCRIPTS", transcripts), \
+                    mock.patch.object(candidate_evaluation, "EVALUATIONS", evaluations), \
+                    mock.patch.object(watcher, "ollama_generate") as generate, \
+                    mock.patch(
+                        "notion_agent.sync_evaluation_feedback_if_enabled"
+                    ) as notion_sync:
+                path = watcher.create_candidate_evaluation_from_transcript(
+                    "session",
+                    transcript,
+                    meeting_date="2026-08-11",
+                    meeting_title="Interview | Jane Doe | Data Analyst",
+                    participants=["Jane Doe", "Interviewer"],
+                    classification=classification,
+                )
+            self.assertTrue(path.is_file())
+            self.assertIn("Не проводилося", path.read_text(encoding="utf-8"))
+            generate.assert_not_called()
+            notion_sync.assert_not_called()
+
+    def test_ambiguous_interview_keyword_falls_back_to_regular_note(self):
+        transcript = """# Customer interview — churn research
+
+- **Назва зустрічі:** Customer interview — churn research
+
+## Транскрипт
+
+[10:00] Customer: We discuss churn
+"""
+        summary = "\n".join(watcher.REQUIRED_HEADINGS)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ("notes", "recordings", "transcripts"):
+                (root / name).mkdir()
+            with mock.patch.object(watcher, "CANDIDATE_EVALUATION_ENABLED", True), \
+                    mock.patch.object(watcher.project_paths, "NOTES", root / "notes"), \
+                    mock.patch.object(watcher.project_paths, "RECORDINGS", root / "recordings"), \
+                    mock.patch.object(watcher.project_paths, "TRANSCRIPTS", root / "transcripts"), \
+                    mock.patch.object(watcher, "summarize", return_value=summary), \
+                    mock.patch.object(watcher, "make_title", return_value="Churn research"), \
+                    mock.patch.object(
+                        watcher, "create_candidate_evaluation_from_transcript"
+                    ) as candidate_flow, \
+                    mock.patch("notion_agent.sync_note_if_enabled"):
+                note = watcher.create_note_from_transcript("session", transcript)
+            self.assertTrue(note.is_file())
+            candidate_flow.assert_not_called()
+
     def test_refresh_note_replaces_transcript_and_collapsed_speaker_mapping(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -400,8 +668,8 @@ class WatcherStateTests(unittest.TestCase):
                     "merged_labels": ["SPEAKER_01"],
                 }}},
             )
-            with mock.patch.object(watcher, "NOTES", notes), \
-                 mock.patch.object(watcher, "TRANSCRIPTS", transcripts):
+            with mock.patch.object(watcher.project_paths, "NOTES", notes), \
+                 mock.patch.object(watcher.project_paths, "TRANSCRIPTS", transcripts):
                 watcher.refresh_note_transcript("session")
             refreshed = note.read_text()
             self.assertIn("[SPEAKER_00] дія", refreshed)
@@ -427,8 +695,8 @@ class WatcherStateTests(unittest.TestCase):
             pipeline_utils.atomic_write_json(
                 transcripts / "session" / "manifest.json", {"quality": {}}
             )
-            with mock.patch.object(watcher, "NOTES", notes), \
-                 mock.patch.object(watcher, "TRANSCRIPTS", transcripts):
+            with mock.patch.object(watcher.project_paths, "NOTES", notes), \
+                 mock.patch.object(watcher.project_paths, "TRANSCRIPTS", transcripts):
                 watcher.refresh_note_transcript("session")
             refreshed = note.read_text()
             self.assertIn("| LOCAL_00 | |", refreshed)
@@ -459,9 +727,9 @@ class WatcherStateTests(unittest.TestCase):
             (recordings / f"{session}_sys.wav").write_bytes(b"sys")
             manifest = recordings / f"{session}.json"
             pipeline_utils.atomic_write_json(manifest, {"status": "recording"})
-            with mock.patch.object(watcher, "RECORDINGS", recordings), \
-                 mock.patch.object(watcher, "NOTES", notes), \
-                 mock.patch.object(watcher, "FAILED", failed):
+            with mock.patch.object(watcher.project_paths, "RECORDINGS", recordings), \
+                 mock.patch.object(watcher.project_paths, "NOTES", notes), \
+                 mock.patch.object(watcher.project_paths, "FAILED", failed):
                 self.assertEqual(watcher.find_ready_sessions(), [])
                 pipeline_utils.atomic_write_json(manifest, {"status": "recorded"})
                 self.assertEqual(watcher.find_ready_sessions(), [session])
@@ -492,9 +760,10 @@ class WatcherStateTests(unittest.TestCase):
                 recordings / "failed.json", {"status": "recording_failed"}
             )
 
-            with mock.patch.object(watcher, "RECORDINGS", recordings), \
-                 mock.patch.object(watcher, "TRANSCRIPTS", transcripts), \
-                 mock.patch.object(watcher, "NOTES", notes), \
+            with mock.patch.object(watcher.project_paths, "RECORDINGS", recordings), \
+                 mock.patch.object(watcher.project_paths, "TRANSCRIPTS", transcripts), \
+                 mock.patch.object(watcher.project_paths, "NOTES", notes), \
+                 mock.patch.object(watcher.project_paths, "FAILED", root / "failed"), \
                  mock.patch.object(watcher, "ROTATE_DAYS", 5), \
                  mock.patch.object(watcher.time, "time", return_value=now):
                 watcher.rotate_old_wavs()
@@ -503,10 +772,370 @@ class WatcherStateTests(unittest.TestCase):
             self.assertFalse(any(recordings.glob("complete_*.wav")))
             self.assertEqual(len(list(recordings.glob("failed_*.wav"))), 2)
 
+    def test_rotation_rejects_parent_directory_session(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            recordings = root / "recordings"
+            transcripts = root / "transcripts"
+            notes = root / "notes"
+            failed = root / "failed"
+            for path in (recordings, transcripts, notes, failed):
+                path.mkdir()
+            marker = root / "must-survive.txt"
+            marker.write_text("safe", encoding="utf-8")
+            malicious = recordings / "...json"
+            pipeline_utils.atomic_write_json(malicious, {
+                "status": "complete",
+                "candidate_evaluation": str(marker),
+            })
+            old = 2_000_000_000.0 - 6 * 86400
+            watcher.os.utime(malicious, (old, old))
+
+            with mock.patch.object(watcher.project_paths, "RECORDINGS", recordings), \
+                 mock.patch.object(watcher.project_paths, "TRANSCRIPTS", transcripts), \
+                 mock.patch.object(watcher.project_paths, "NOTES", notes), \
+                 mock.patch.object(watcher.project_paths, "FAILED", failed), \
+                 mock.patch.object(watcher, "ROTATE_DAYS", 5), \
+                 mock.patch.object(watcher.time, "time", return_value=2_000_000_000.0):
+                watcher.rotate_old_wavs()
+
+            self.assertTrue(root.is_dir())
+            self.assertEqual(marker.read_text(encoding="utf-8"), "safe")
+            self.assertTrue(malicious.exists())
+
+    def test_session_validation_rejects_dot_segments(self):
+        for value in (".", "..", "../escape", "*", ""):
+            with self.subTest(value=value):
+                with self.assertRaises((ValueError, argparse.ArgumentTypeError)):
+                    watcher._validate_session(value)
+
     def test_summary_structure_validation(self):
-        complete = "\n".join(watcher.REQUIRED_HEADINGS)
+        complete = """## TL;DR
+Коротко.
+
+## Основні тези
+- Теза
+
+## Рішення
+- —
+
+## Action items
+- —
+
+## Відкриті питання
+- —
+"""
         self.assertTrue(watcher._valid_summary(complete))
         self.assertFalse(watcher._valid_summary("## TL;DR\nтільки одна секція"))
+        self.assertFalse(watcher._valid_summary(complete + "\n## Зайва секція\n- ні"))
+
+    def test_evidence_validation_drops_fabricated_quotes(self):
+        transcript = "[00:10] Максим: Пропоную почати з ринку США."
+        raw = {
+            "items": [
+                {
+                    "type": "recommendation",
+                    "claim": "Почати з ринку США",
+                    "speaker": "Максим",
+                    "evidence": [
+                        {"timestamp": "00:10", "quote": "Це вже остаточне рішення"}
+                    ],
+                }
+            ]
+        }
+        ledger, dropped = watcher._validated_evidence_ledger(raw, transcript)
+        self.assertEqual(ledger, {"items": []})
+        self.assertEqual(dropped, 1)
+
+    def test_evidence_validation_keeps_quote_and_clears_wrong_timestamp(self):
+        transcript = "[00:10] Максим: Пропоную почати з ринку США."
+        raw = {
+            "items": [{
+                "type": "recommendation",
+                "claim": "Почати з ринку США",
+                "speaker": "Максим",
+                "evidence": [{
+                    "timestamp": "99:99",
+                    "quote": "Пропоную почати з ринку США",
+                }],
+            }]
+        }
+        ledger, dropped = watcher._validated_evidence_ledger(raw, transcript)
+        self.assertEqual(dropped, 0)
+        self.assertEqual(ledger["items"][0]["evidence"][0]["timestamp"], "")
+
+    def test_commitment_owner_must_be_the_evidence_speaker(self):
+        transcript = (
+            "[00:10] External Participant: Потрібно підготувати звіт завтра.\n"
+            "[00:11] Current User: Я перевірю дані окремо."
+        )
+        raw = {"items": [{
+            "type": "commitment",
+            "claim": "Підготувати звіт",
+            "speaker": "Current User",
+            "owners": ["Current User"],
+            "status": "open",
+            "commitment_strength": "strong",
+            "evidence": [{
+                "timestamp": "00:10",
+                "quote": "Потрібно підготувати звіт завтра",
+            }],
+        }]}
+        ledger, dropped = watcher._validated_evidence_ledger(raw, transcript)
+        self.assertEqual(dropped, 0)
+        self.assertEqual(ledger["items"][0]["speaker"], "External Participant")
+        self.assertEqual(ledger["items"][0]["owners"], [])
+
+    def test_commitment_keeps_owner_who_spoke_the_evidence(self):
+        transcript = "[00:10] Current User: Я підготую звіт завтра."
+        raw = {"items": [{
+            "type": "commitment",
+            "claim": "Підготувати звіт",
+            "speaker": "External Participant",
+            "owners": ["Current User"],
+            "status": "open",
+            "commitment_strength": "strong",
+            "evidence": [{
+                "timestamp": "00:10",
+                "quote": "Я підготую звіт завтра",
+            }],
+        }]}
+        ledger, _ = watcher._validated_evidence_ledger(raw, transcript)
+        self.assertEqual(ledger["items"][0]["speaker"], "Current User")
+        self.assertEqual(ledger["items"][0]["owners"], ["Current User"])
+
+    def test_context_generation_cannot_bypass_decision_reconciliation(self):
+        transcript = "[00:10] Максим: Домовились почати з ринку США."
+        raw = json.dumps({
+            "items": [{
+                "type": "decision",
+                "claim": "Почати з ринку США",
+                "speaker": "Максим",
+                "owners": [],
+                "deadline": "",
+                "status": "active",
+                "commitment_strength": "not_applicable",
+                "confidence": "high",
+                "evidence": [{
+                    "timestamp": "00:10",
+                    "quote": "Домовились почати з ринку США",
+                }],
+            }]
+        }, ensure_ascii=False)
+        generate = mock.Mock(side_effect=[raw, json.dumps({"items": []})])
+        with mock.patch.object(watcher, "ollama_generate", generate):
+            ledger = watcher._generate_evidence_ledger(
+                "context prompt",
+                transcript,
+                stage="context",
+                allowed_types=watcher.CONTEXT_EVIDENCE_TYPES,
+            )
+        self.assertEqual(ledger, {"items": []})
+        self.assertEqual(generate.call_count, 2)
+
+    def test_evidence_json_repair_keeps_full_output_budget(self):
+        generate = mock.Mock(side_effect=[
+            '{"items":[',
+            json.dumps({"items": []}),
+        ])
+        with mock.patch.object(watcher, "ollama_generate", generate):
+            ledger = watcher._generate_evidence_ledger(
+                "merge prompt",
+                "transcript",
+                stage="context evidence merge",
+                num_predict=4096,
+                allowed_types=watcher.CONTEXT_EVIDENCE_TYPES,
+            )
+        self.assertEqual(ledger, {"items": []})
+        self.assertEqual(
+            [call.kwargs["num_predict"] for call in generate.call_args_list],
+            [4096, 4096],
+        )
+
+    def test_critical_merge_has_larger_output_budget(self):
+        self.assertEqual(watcher.SUMMARY_CRITICAL_MERGE_NUM_PREDICT, 8192)
+        self.assertEqual(watcher.SUMMARY_CRITICAL_RECONCILE_NUM_PREDICT, 8192)
+
+    def test_grounded_sections_do_not_promote_recommendations_or_completed_work(self):
+        draft = """## TL;DR
+Обговорили запуск.
+
+## Основні тези
+- Тези.
+
+## Рішення
+- Запускатися у США
+
+## Action items
+- [Максим] Надіслати Meta Ads Library
+
+## Відкриті питання
+- GDPR
+"""
+        ledger = {
+            "items": [
+                {"type": "recommendation", "status": "active", "claim": "Розглянути США"},
+                {"type": "hypothesis", "status": "active", "claim": "У США нижчі регуляторні бар'єри"},
+                {"type": "decision", "status": "active", "claim": "Проводити щотижневий sync"},
+                {
+                    "type": "commitment",
+                    "status": "open",
+                    "claim": "Проаналізувати конкурентів",
+                    "owners": ["Інтерв’юер"],
+                    "deadline": "",
+                },
+                {
+                    "type": "commitment",
+                    "status": "open",
+                    "claim": "Організувати зустріч із creative team",
+                    "owners": ["Максим"],
+                    "deadline": "наступного тижня",
+                    "commitment_strength": "soft",
+                },
+                {
+                    "type": "completed_action",
+                    "status": "completed",
+                    "claim": "Надіслати Meta Ads Library",
+                    "owners": ["Максим"],
+                },
+            ]
+        }
+        summary = watcher._render_grounded_sections(draft, ledger)
+        self.assertNotIn("Обговорили запуск.", summary)
+        self.assertIn("Явні рішення: Проводити щотижневий sync.", summary)
+        decisions = watcher._summary_section(summary, "## Рішення")
+        actions = watcher._summary_section(summary, "## Action items")
+        self.assertEqual(decisions, "- Проводити щотижневий sync")
+        self.assertIn("[Інтерв’юер] Проаналізувати конкурентів", actions)
+        self.assertIn("Спробувати організувати", actions)
+        self.assertIn("дедлайн: наступного тижня", actions)
+        self.assertNotIn("США", decisions)
+        self.assertNotIn("Meta Ads Library", actions)
+
+    def test_summary_builds_and_persists_evidence_ledger(self):
+        transcript = "[00:10] Інтерв’юер: Домовились проводити щотижневий sync."
+        raw_ledger = json.dumps({
+            "items": [{
+                "type": "decision",
+                "claim": "Проводити щотижневий sync",
+                "speaker": "Інтерв’юер",
+                "owners": [],
+                "deadline": "",
+                "status": "active",
+                "commitment_strength": "not_applicable",
+                "confidence": "high",
+                "evidence": [{
+                    "timestamp": "00:10",
+                    "quote": "Домовились проводити щотижневий sync",
+                }],
+            }]
+        }, ensure_ascii=False)
+        with tempfile.TemporaryDirectory() as directory:
+            transcripts = Path(directory) / "transcripts"
+            session = "meeting"
+            (transcripts / session).mkdir(parents=True)
+            empty_ledger = json.dumps({"items": []})
+            generate = mock.Mock(side_effect=[
+                raw_ledger,
+                empty_ledger,
+                "Рішення явно підтверджене і не скасоване.",
+                raw_ledger,
+            ])
+            with mock.patch.object(watcher.project_paths, "TRANSCRIPTS", transcripts), \
+                    mock.patch.object(watcher, "ollama_generate", generate), \
+                    mock.patch.object(watcher, "SUMMARY_EXTRACT_THINK", False), \
+                    mock.patch.object(watcher, "SUMMARY_RECONCILE_THINK", True):
+                summary = watcher.summarize(session, transcript)
+                second = watcher.summarize(session, transcript)
+            evidence = json.loads(
+                (transcripts / session / "summary-evidence.json").read_text()
+            )
+        self.assertEqual(summary, second)
+        self.assertEqual(generate.call_count, 4)
+        self.assertEqual(
+            [call.kwargs["think"] for call in generate.call_args_list],
+            [False, False, True, False],
+        )
+        self.assertFalse(generate.call_args_list[2].kwargs["json_mode"])
+        self.assertTrue(generate.call_args_list[3].kwargs["json_mode"])
+        self.assertEqual(evidence["items"][0]["type"], "decision")
+        self.assertTrue(watcher._valid_summary(summary))
+
+    def test_reconciliation_supersedes_rejected_locale_limit(self):
+        transcript = """[14:09:49] Andrii: Давайте візьмемо ікс локалей, не всі п'ятнадцять.
+[14:10:13] Oleksandr: Обмежувати смислу немає, робимо паралельно все, що влазить.
+"""
+        proposed = {
+            "type": "proposal",
+            "claim": "Обмежити роботу кількома локалями",
+            "speaker": "Andrii",
+            "owners": [],
+            "deadline": "",
+            "status": "open",
+            "commitment_strength": "not_applicable",
+            "confidence": "high",
+            "evidence": [{
+                "timestamp": "14:09:49",
+                "quote": "Давайте візьмемо ікс локалей, не всі п'ятнадцять",
+            }],
+        }
+        current = {
+            "type": "decision",
+            "claim": "Не встановлювати жорсткого ліміту локалей",
+            "speaker": "Oleksandr",
+            "owners": [],
+            "deadline": "",
+            "status": "active",
+            "commitment_strength": "not_applicable",
+            "confidence": "high",
+            "evidence": [{
+                "timestamp": "14:10:13",
+                "quote": "Обмежувати смислу немає, робимо паралельно все, що влазить",
+            }],
+        }
+        reconciled_proposal = {
+            **proposed,
+            "status": "superseded",
+            "evidence": proposed["evidence"] + current["evidence"],
+        }
+        critical_raw = json.dumps(
+            {"items": [proposed, current]}, ensure_ascii=False
+        )
+        reconciled_raw = json.dumps(
+            {"items": [reconciled_proposal, current]}, ensure_ascii=False
+        )
+        empty_ledger = json.dumps({"items": []})
+        with tempfile.TemporaryDirectory() as directory:
+            transcripts = Path(directory) / "transcripts"
+            session = "localization"
+            (transcripts / session).mkdir(parents=True)
+            generate = mock.Mock(side_effect=[
+                critical_raw,
+                empty_ledger,
+                "Пізніша репліка відхиляє початкове обмеження локалей.",
+                reconciled_raw,
+            ])
+            with mock.patch.object(watcher.project_paths, "TRANSCRIPTS", transcripts), \
+                    mock.patch.object(watcher, "ollama_generate", generate), \
+                    mock.patch.object(watcher, "SUMMARY_EXTRACT_THINK", False), \
+                    mock.patch.object(watcher, "SUMMARY_RECONCILE_THINK", True):
+                summary = watcher.summarize(session, transcript)
+            reasoning_call = generate.call_args_list[2]
+            reconcile_call = generate.call_args_list[3]
+            evidence = json.loads(
+                (transcripts / session / "summary-evidence.json").read_text()
+            )
+
+        decisions = watcher._summary_section(summary, "## Рішення")
+        self.assertEqual(decisions, "- Не встановлювати жорсткого ліміту локалей")
+        self.assertNotIn("Обмежити роботу кількома локалями", decisions)
+        self.assertTrue(reasoning_call.kwargs["think"])
+        self.assertFalse(reasoning_call.kwargs["json_mode"])
+        self.assertFalse(reconcile_call.kwargs["think"])
+        self.assertTrue(reconcile_call.kwargs["json_mode"])
+        self.assertIn("не всі п'ятнадцять", reconcile_call.args[0])
+        self.assertIn("Обмежувати смислу немає", reconcile_call.args[0])
+        self.assertEqual(evidence["items"][0]["status"], "superseded")
 
     def test_failure_is_redacted_and_scheduled_for_retry(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -521,11 +1150,11 @@ class WatcherStateTests(unittest.TestCase):
                 recordings / f"{session}.json",
                 {"status": "recorded", "processing_attempts": 0},
             )
-            with mock.patch.object(watcher, "RECORDINGS", recordings), \
-                 mock.patch.object(watcher, "FAILED", failed), \
-                 mock.patch.object(watcher, "NOTES", notes):
+            with mock.patch.object(watcher.project_paths, "RECORDINGS", recordings), \
+                 mock.patch.object(watcher.project_paths, "FAILED", failed), \
+                 mock.patch.object(watcher.project_paths, "NOTES", notes):
                 try:
-                    raise RuntimeError("secret hf_SUPERSECRET")
+                    raise RuntimeError("secret hf_SUPERSECRET ntn_NOTIONSECRET")
                 except RuntimeError:
                     watcher.handle_failure(session)
             manifest = json.loads((recordings / f"{session}.json").read_text())
@@ -533,7 +1162,60 @@ class WatcherStateTests(unittest.TestCase):
             self.assertEqual(manifest["status"], "processing_failed")
             self.assertEqual(manifest["processing_attempts"], 1)
             self.assertNotIn("hf_SUPERSECRET", error_file.read_text())
+            self.assertNotIn("ntn_NOTIONSECRET", error_file.read_text())
             self.assertEqual(error_file.stat().st_mode & 0o777, 0o600)
+
+    def test_interrupted_processing_stops_after_retry_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            recordings, notes = root / "recordings", root / "notes"
+            recordings.mkdir()
+            notes.mkdir()
+            session = "interrupted"
+            for track in ("mic", "sys"):
+                (recordings / f"{session}_{track}.wav").write_bytes(b"audio")
+            pipeline_utils.atomic_write_json(
+                recordings / f"{session}.json",
+                {
+                    "status": "processing",
+                    "processing_attempts": watcher.MAX_AUTO_RETRIES,
+                },
+            )
+            with mock.patch.object(watcher.project_paths, "RECORDINGS", recordings), \
+                    mock.patch.object(watcher.project_paths, "NOTES", notes), \
+                    mock.patch.object(watcher, "AUDIO_PIPELINE_ENABLED", True):
+                self.assertEqual(watcher.find_ready_sessions(), [])
+            manifest = json.loads(
+                (recordings / f"{session}.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["status"], "terminal_failed")
+
+    def test_failed_processing_stops_after_retry_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            recordings, notes = root / "recordings", root / "notes"
+            recordings.mkdir()
+            notes.mkdir()
+            session = "retry-exhausted"
+            for track in ("mic", "sys"):
+                (recordings / f"{session}_{track}.wav").write_bytes(b"audio")
+            pipeline_utils.atomic_write_json(
+                recordings / f"{session}.json",
+                {
+                    "status": "processing_failed",
+                    "processing_attempts": watcher.MAX_AUTO_RETRIES,
+                    "next_retry_at": 0,
+                },
+            )
+            with mock.patch.object(watcher.project_paths, "RECORDINGS", recordings), \
+                    mock.patch.object(watcher.project_paths, "NOTES", notes), \
+                    mock.patch.object(watcher, "AUDIO_PIPELINE_ENABLED", True):
+                self.assertEqual(watcher.find_ready_sessions(), [])
+            manifest = json.loads(
+                (recordings / f"{session}.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["status"], "terminal_failed")
+            self.assertEqual(manifest["stage"], "retry_limit")
 
     def test_short_recording_finishes_without_asr_or_llm(self):
         import numpy as np
@@ -554,10 +1236,10 @@ class WatcherStateTests(unittest.TestCase):
             pipeline_utils.atomic_write_json(
                 recordings / f"{session}.json", {"status": "recorded"}
             )
-            with mock.patch.object(watcher, "RECORDINGS", recordings), \
-                 mock.patch.object(watcher, "TRANSCRIPTS", transcripts), \
-                 mock.patch.object(watcher, "NOTES", notes), \
-                 mock.patch.object(watcher, "FAILED", failed), \
+            with mock.patch.object(watcher.project_paths, "RECORDINGS", recordings), \
+                 mock.patch.object(watcher.project_paths, "TRANSCRIPTS", transcripts), \
+                 mock.patch.object(watcher.project_paths, "NOTES", notes), \
+                 mock.patch.object(watcher.project_paths, "FAILED", failed), \
                  mock.patch.object(watcher, "MIN_SESSION_SECONDS", 10):
                 watcher.process_session(session)
             manifest = json.loads((recordings / f"{session}.json").read_text())
@@ -586,10 +1268,10 @@ class WatcherStateTests(unittest.TestCase):
             pipeline_utils.atomic_write_json(
                 recordings / f"{session}.json", {"status": "recorded"}
             )
-            with mock.patch.object(watcher, "RECORDINGS", recordings), \
-                 mock.patch.object(watcher, "TRANSCRIPTS", transcripts), \
-                 mock.patch.object(watcher, "NOTES", notes), \
-                 mock.patch.object(watcher, "FAILED", failed), \
+            with mock.patch.object(watcher.project_paths, "RECORDINGS", recordings), \
+                 mock.patch.object(watcher.project_paths, "TRANSCRIPTS", transcripts), \
+                 mock.patch.object(watcher.project_paths, "NOTES", notes), \
+                 mock.patch.object(watcher.project_paths, "FAILED", failed), \
                  mock.patch.object(watcher, "MIN_SESSION_SECONDS", 10), \
                  mock.patch.object(watcher.subprocess, "run") as run:
                 watcher.process_session(session)

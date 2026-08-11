@@ -17,6 +17,7 @@ from pipeline_utils import (
     atomic_write_json,
     atomic_write_text,
     audio_info,
+    ensure_private_dir,
     file_fingerprint,
     load_dotenv,
     normalized_audio,
@@ -53,6 +54,20 @@ def _cache_valid(path: Path, expected: dict[str, Any]) -> bool:
     data = read_json(path)
     return (isinstance(data, dict) and data.get("_meta") == expected
             and isinstance(data.get("segments"), list))
+
+
+def _source_fingerprint(path: Path, cache_path: Path) -> dict[str, Any]:
+    """Reuse a trusted SHA when cheap size+mtime fields have not changed."""
+    cheap = file_fingerprint(path, with_hash=False)
+    cached = ((read_json(cache_path, {}) or {}).get("_meta") or {}).get("source")
+    if (
+        isinstance(cached, dict)
+        and cached.get("size") == cheap["size"]
+        and cached.get("mtime_ns") == cheap["mtime_ns"]
+        and cached.get("sha256")
+    ):
+        return cached
+    return file_fingerprint(path)
 
 
 def _as_float(value: Any, default: float = 0.0) -> float:
@@ -494,7 +509,7 @@ def main() -> None:
 
     session = Path(args.session_prefix).name
     work_dir = TRANSCRIPTS_DIR / session
-    work_dir.mkdir(parents=True, exist_ok=True)
+    ensure_private_dir(work_dir)
     mic_json = work_dir / f"{mic_source.stem}.json"
     sys_json = work_dir / f"{sys_source.stem}.json"
     session_manifest = read_json(BASE / "recordings" / f"{session}.json", {}) or {}
@@ -542,10 +557,10 @@ def main() -> None:
         mic_info, sys_info = audio_info(mic_wav), audio_info(sys_wav)
         mic_meta = {
             **common,
-            "source": file_fingerprint(mic_source),
+            "source": _source_fingerprint(mic_source, mic_json),
             "diarize": mic_diarization,
         }
-        sys_meta = {**common, "source": file_fingerprint(sys_source), "diarize": True,
+        sys_meta = {**common, "source": _source_fingerprint(sys_source, sys_json), "diarize": True,
                     "num_speakers": args.num_speakers}
         print("Движок транскрипції: MLX Whisper; processing audio: mono 16 kHz")
         mic_json = run_mlx(

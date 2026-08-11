@@ -17,6 +17,15 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def ensure_private_dir(path: Path) -> Path:
+    """Create a runtime data directory and keep it private to the current user."""
+    if path.is_symlink():
+        raise RuntimeError(f"Runtime-каталог не може бути symlink: {path}")
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path.chmod(0o700)
+    return path
+
+
 def load_dotenv(path: Path, *, override: bool = False) -> None:
     """Мінімальний parser KEY=VALUE без виконання shell-коду."""
     if not path.exists():
@@ -34,7 +43,7 @@ def load_dotenv(path: Path, *, override: bool = False) -> None:
 
 def atomic_write_text(path: Path, text: str, *, mode: int | None = None) -> None:
     """Записує файл через fsync + atomic rename в межах тієї самої директорії."""
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp",
                                     dir=path.parent)
     tmp = Path(tmp_name)
@@ -126,9 +135,10 @@ def audio_signal_info(path: Path) -> dict[str, float]:
 
 def find_ffmpeg() -> str:
     for candidate in (
-        shutil.which("ffmpeg"),
         "/opt/homebrew/bin/ffmpeg",
         "/usr/local/bin/ffmpeg",
+        "/usr/bin/ffmpeg",
+        shutil.which("ffmpeg"),
     ):
         if candidate and Path(candidate).exists():
             return str(candidate)
@@ -148,7 +158,7 @@ def normalized_audio(source: Path, target: Path, *, sample_rate: int = 16_000) -
         except Exception:
             pass
 
-    target.parent.mkdir(parents=True, exist_ok=True)
+    ensure_private_dir(target.parent)
     fd, tmp_name = tempfile.mkstemp(prefix=f".{target.stem}.", suffix=".wav",
                                     dir=target.parent)
     os.close(fd)

@@ -12,8 +12,17 @@ LOCK_DIR=".record.toggle.lock"
 MODE="${1:-}"
 DIALOG_TIMEOUT=25
 mkdir -p logs
-# .env: інші налаштування діють і при запуску з хоткея; режим задає popup/аргумент
-set -a; [ -f .env ] && source .env; set +a
+
+audio_module_enabled() {
+    local value="true"
+    if [ -f .env ]; then
+        value="$(sed -n 's/^[[:space:]]*AUDIO_PIPELINE_ENABLED[[:space:]]*=[[:space:]]*//p' .env | tail -n 1)"
+        value="${value%%#*}"
+        value="$(printf '%s' "$value" | tr -d "[:space:]'\"")"
+    fi
+    case "${value:l}" in false|0|no|off) return 1;; esac
+    return 0
+}
 
 notify() {
     osascript -e "display notification \"$1\" with title \"Meeting Transcriber\""
@@ -36,11 +45,30 @@ choose_mode() {
     return 1
 }
 
-if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+acquire_lock() {
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+        (umask 077; printf '%s\n' "$$" > "$LOCK_DIR/pid")
+        return 0
+    fi
+    # A freshly created lock may not have its owner file yet. It is busy, not stale.
+    [ -f "$LOCK_DIR/pid" ] || return 1
+    local owner=""
+    [ -f "$LOCK_DIR/pid" ] && owner="$(tr -cd '0-9' < "$LOCK_DIR/pid")"
+    if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then
+        return 1
+    fi
+    # SIGKILL не запускає trap: прибираємо лише перевірений stale lock.
+    [ -f "$LOCK_DIR/pid" ] && rm -f "$LOCK_DIR/pid"
+    rmdir "$LOCK_DIR" 2>/dev/null || return 1
+    mkdir "$LOCK_DIR" 2>/dev/null || return 1
+    (umask 077; printf '%s\n' "$$" > "$LOCK_DIR/pid")
+}
+
+if ! acquire_lock; then
     notify "Зачекайте: попередня команда запису ще виконується"
     exit 1
 fi
-trap 'rmdir "$LOCK_DIR" 2>/dev/null' EXIT
+trap 'rm -f "$LOCK_DIR/pid"; rmdir "$LOCK_DIR" 2>/dev/null' EXIT
 
 recording_pid() {
     [ -f "$PID_FILE" ] || return 1
@@ -53,7 +81,7 @@ recording_pid() {
 
 if PID="$(recording_pid)"; then
     kill -INT "$PID"
-    # record.py сам прибере PID лише після flush, mono-конвертації й manifest.
+    # record.py сам прибере PID лише після flush доріжок і запису manifest.
     for _ in {1..60}; do
         kill -0 "$PID" 2>/dev/null || break
         sleep 0.5
@@ -66,6 +94,10 @@ if PID="$(recording_pid)"; then
     fi
 else
     rm -f "$PID_FILE"
+    if ! audio_module_enabled; then
+        notify "Модуль запису звуку вимкнено"
+        exit 3
+    fi
     if [ -z "$MODE" ]; then
         MODE="$(choose_mode)" || exit 0
     fi
@@ -80,7 +112,9 @@ else
             notify "🔴 Йде запис — режим Навушники (Raw)"
         fi
     else
-        if tail -n 12 logs/record.log | grep -q "MICROPHONE_PERMISSION_DENIED"; then
+        if tail -n 12 logs/record.log | grep -q "AUDIO_MODULE_DISABLED"; then
+            notify "Модуль запису звуку вимкнено"
+        elif tail -n 12 logs/record.log | grep -q "MICROPHONE_PERMISSION_DENIED"; then
             notify "Немає доступу до мікрофона — дозвольте launcher у Privacy & Security → Microphone"
         elif tail -n 12 logs/record.log | grep -q "MICROPHONE_DEVICE_MISSING"; then
             notify "macOS не бачить пристрій мікрофона — перевірте Sound → Input"

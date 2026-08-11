@@ -5,6 +5,7 @@
 #   chmod +x install.sh && ./install.sh
 
 set -e
+umask 077
 cd "$(dirname "$0")"
 
 ok()   { echo "  ✅ $1"; }
@@ -64,32 +65,44 @@ fi
 
 # ---------- 6. .env ----------
 step "Конфіг (.env)"
+NEW_ENV=false
 if [ ! -f .env ]; then
     cp .env.example .env
     chmod 600 .env
-    echo "  Введіть HuggingFace токен (hf_...), Enter — пропустити:"
-    read -r HF_INPUT
-    if [ -n "$HF_INPUT" ]; then
-        ENV_TMP=".env.$$.tmp"
-        : > "$ENV_TMP"
-        while IFS= read -r line; do
-            if [[ "$line" == HF_TOKEN=* ]]; then
-                printf 'HF_TOKEN=%s\n' "$HF_INPUT" >> "$ENV_TMP"
-            else
-                printf '%s\n' "$line" >> "$ENV_TMP"
-            fi
-        done < .env
-        chmod 600 "$ENV_TMP"
-        mv "$ENV_TMP" .env
-        unset HF_INPUT
-        ok "HF_TOKEN записано в .env"
-    else
-        MANUAL+=("Вписати HF_TOKEN у .env (токен: https://huggingface.co/settings/tokens)")
-    fi
+    NEW_ENV=true
 else
     ok ".env вже існує — не чіпаю"
 fi
 chmod 600 .env
+
+if [ "$NEW_ENV" = true ]; then
+    echo ""
+    .venv/bin/python3 modules.py configure --no-apply
+    if grep -Eq '^AUDIO_PIPELINE_ENABLED=(true|1|yes|on)([[:space:]]|$)' .env; then
+        echo ""
+        echo "  Для аудіомодуля введіть HuggingFace токен (hf_...), Enter — пропустити:"
+        read -rs HF_INPUT
+        echo ""
+        if [ -n "$HF_INPUT" ]; then
+            ENV_TMP="$(mktemp ./.env.XXXXXX)"
+            trap 'rm -f "$ENV_TMP"' EXIT HUP INT TERM
+            while IFS= read -r line; do
+                if [[ "$line" == HF_TOKEN=* ]]; then
+                    printf 'HF_TOKEN=%s\n' "$HF_INPUT" >> "$ENV_TMP"
+                else
+                    printf '%s\n' "$line" >> "$ENV_TMP"
+                fi
+            done < .env
+            chmod 600 "$ENV_TMP"
+            mv "$ENV_TMP" .env
+            trap - EXIT HUP INT TERM
+            unset HF_INPUT
+            ok "HF_TOKEN записано в .env"
+        else
+            MANUAL+=("Вписати HF_TOKEN у .env (токен: https://huggingface.co/settings/tokens)")
+        fi
+    fi
+fi
 
 # ---------- 7. Модель ----------
 step "LLM-модель"
@@ -104,8 +117,9 @@ else
 fi
 
 # ---------- 8. Права на скрипти ----------
-chmod +x toggle_record.sh request_record.sh meeting_rec.5s.sh
+chmod +x modules.py toggle_record.sh request_record.sh meeting_rec.5s.sh
 mkdir -p recordings transcripts notes failed logs
+chmod 700 recordings transcripts notes failed logs
 
 # ---------- 9. LaunchAgents (watcher + mic-autostart) ----------
 # plist-и генеруються з поточного шляху проекту — папку можна переносити,
@@ -113,7 +127,10 @@ mkdir -p recordings transcripts notes failed logs
 step "Фонові сервіси (launchd)"
 PROJ="$(pwd)"
 SERVICE_LOG_DIR="$HOME/Library/Logs/MeetingTranscriber"
-mkdir -p "$SERVICE_LOG_DIR"
+mkdir -p "$HOME/Library/LaunchAgents" "$SERVICE_LOG_DIR"
+chmod 700 "$HOME/Library/LaunchAgents" "$SERVICE_LOG_DIR"
+touch "$SERVICE_LOG_DIR/watcher.log" "$SERVICE_LOG_DIR/mic-autostart.log"
+chmod 600 "$SERVICE_LOG_DIR/watcher.log" "$SERVICE_LOG_DIR/mic-autostart.log"
 
 make_plist() {  # $1 = label, далі — ProgramArguments
     local LABEL=$1; shift
@@ -143,22 +160,18 @@ PLIST
 make_plist local.meeting-transcriber.watcher "$PROJ/.venv/bin/python3" "$PROJ/watch_and_process.py"
 make_plist local.meeting-transcriber.mic-autostart "$PROJ/.venv/bin/python3" "$PROJ/mic_watch.py"
 
-for AGENT in local.meeting-transcriber.watcher local.meeting-transcriber.mic-autostart; do
-    launchctl bootout "gui/$(id -u)/$AGENT" 2>/dev/null || true
-    launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/$AGENT.plist
-done
-sleep 2
-launchctl list | grep -q meeting-transcriber && ok "watcher запущено ($SERVICE_LOG_DIR/watcher.log)" \
-    || warn "watcher не піднявся — $SERVICE_LOG_DIR/watcher.log"
-launchctl list | grep -q mic-autostart && ok "mic-autostart запущено ($SERVICE_LOG_DIR/mic-autostart.log)" \
-    || warn "mic-autostart не піднявся — $SERVICE_LOG_DIR/mic-autostart.log"
+.venv/bin/python3 modules.py apply
+echo ""
+.venv/bin/python3 modules.py status
 
 # ---------- Підсумок ----------
 echo "\n════════════════════════════════════════"
 echo "Встановлення завершено."
-MANUAL+=("Прийняти умови моделей pyannote на HuggingFace (segmentation-3.0, speaker-diarization-community-1)")
-MANUAL+=("Повісити request_record.sh на хоткей у Raycast/Shortcuts — див. README.md")
-MANUAL+=("Перший запуск запису: дати дозволи мікрофона і System Audio Recording (TCC)")
-MANUAL+=("Записувати в НАВУШНИКАХ і за згодою учасників")
+if grep -Eq '^AUDIO_PIPELINE_ENABLED=(true|1|yes|on)([[:space:]]|$)' .env; then
+    MANUAL+=("Прийняти умови моделей pyannote на HuggingFace (segmentation-3.0, speaker-diarization-community-1)")
+    MANUAL+=("Повісити request_record.sh на хоткей у Raycast/Shortcuts — див. README.md")
+    MANUAL+=("Перший запуск запису: дати дозволи мікрофона і System Audio Recording (TCC)")
+    MANUAL+=("Записувати в НАВУШНИКАХ і за згодою учасників")
+fi
 echo "Лишилось руками:"
 for item in "${MANUAL[@]}"; do echo "  • $item"; done

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-v2: автостарт запису по детекції мікрофона.
+Черга ручних команд запису з опційним автостартом по детекції мікрофона.
 
 Кожні кілька секунд перевіряє через CoreAudio, чи якийсь процес використовує
 мікрофон (Zoom/Meet/FaceTime стартував дзвінок). Якщо так і запис ще не йде —
@@ -10,7 +10,10 @@ v2: автостарт запису по детекції мікрофона.
 Свідомо НЕ пише тихо: підтвердження = consent. Одне питання на один
 «сеанс мікрофона» — відмовились, і до кінця дзвінка більше не турбує.
 
-    Запускається як LaunchAgent (див. README.md). Лог: logs/mic-autostart.log.
+Коли MIC_AUTO_START=false, CoreAudio не опитується і popup на початку дзвінка
+не показується. LaunchAgent залишається активним лише для ручних команд.
+
+Запускається як LaunchAgent (див. README.md). Лог: logs/mic-autostart.log.
 """
 
 import ctypes
@@ -21,7 +24,11 @@ import sys
 import time
 from pathlib import Path
 
+from pipeline_utils import load_dotenv
+
 BASE = Path(__file__).parent
+load_dotenv(BASE / ".env")
+
 PID_FILE = BASE / ".record.pid"
 TOGGLE = BASE / "toggle_record.sh"
 REQUEST_DIR = BASE / ".control" / "requests"
@@ -29,6 +36,10 @@ REQUEST_MAX_AGE_SECONDS = 30
 POLL_SECONDS = 4
 CONTROL_POLL_SECONDS = 0.5
 DIALOG_TIMEOUT = 25  # с; нема відповіді = «ні»
+MIC_AUTO_START = os.environ.get("MIC_AUTO_START", "false").lower() == "true"
+AUDIO_PIPELINE_ENABLED = (
+    os.environ.get("AUDIO_PIPELINE_ENABLED", "true").lower() == "true"
+)
 
 _ca = ctypes.CDLL(
     "/System/Library/Frameworks/CoreAudio.framework/Versions/A/CoreAudio")
@@ -143,10 +154,16 @@ def log(msg: str) -> None:
 
 def main() -> None:
     log("mic-watch стартував")
+    if not AUDIO_PIPELINE_ENABLED:
+        log("модуль audio вимкнено; фоновий процес не приймає команди")
+        while True:
+            time.sleep(3600)
+    if not MIC_AUTO_START:
+        log("моніторинг мікрофона на паузі; очікую лише ручні команди")
     # Перезапуск сервісу посеред дзвінка не повинен показувати новий popup.
     # Спершу чекаємо, доки вже активний мікрофон звільниться.
-    armed = not mic_in_use()  # одне питання на один новий сеанс мікрофона
-    if not armed:
+    armed = MIC_AUTO_START and not mic_in_use()
+    if MIC_AUTO_START and not armed:
         log("мікрофон уже активний → чекаю нового сеансу")
     next_mic_check = 0.0
     while True:
@@ -155,6 +172,9 @@ def main() -> None:
                 # Після ручного stop не пропонувати одразу стартувати знову,
                 # якщо Zoom/Meet досі тримає мікрофон відкритим.
                 armed = False
+            if not MIC_AUTO_START:
+                time.sleep(CONTROL_POLL_SECONDS)
+                continue
             now = time.monotonic()
             if now < next_mic_check:
                 time.sleep(CONTROL_POLL_SECONDS)
