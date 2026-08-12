@@ -55,6 +55,24 @@ def _issue(code: str, message: str, severity: str = "warning") -> dict[str, str]
     return {"code": code, "message": message, "severity": severity}
 
 
+def _deduplicate_issues(
+    issues: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    unique: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for item in issues:
+        key = (
+            str(item.get("code", "")),
+            str(item.get("message", "")),
+            str(item.get("severity", "warning")),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+    return unique
+
+
 def _status(issues: list[dict[str, str]]) -> str:
     if any(item["severity"] == "error" for item in issues):
         return "review"
@@ -274,6 +292,7 @@ def finalize_quality_report(session: str) -> dict[str, Any]:
             "error",
         ))
 
+    issues = _deduplicate_issues(issues)
     report_status = _status(issues)
     report = {
         "schema_version": REPORT_SCHEMA_VERSION,
@@ -304,7 +323,7 @@ def finalize_quality_report(session: str) -> dict[str, Any]:
 def report_note_lines(report: dict[str, Any]) -> list[str]:
     """Render concise note metadata; full details remain in quality-report.json."""
     lines = [f"- **Якість:** {report.get('status_label', '—')}"]
-    issues = report.get("issues") or []
+    issues = _deduplicate_issues(report.get("issues") or [])
     if issues:
         messages = "; ".join(
             str(item.get("message", "")).rstrip(".")

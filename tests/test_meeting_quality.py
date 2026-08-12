@@ -76,7 +76,11 @@ class MeetingQualityTests(unittest.TestCase):
                     "_quality": {
                         "status": "pass",
                         "errors": [],
-                        "warnings": [{"code": "missing_owner"}],
+                        "warnings": [
+                            {"code": "missing_owner", "claim": "Перша дія"},
+                            {"code": "missing_owner", "claim": "Друга дія"},
+                            {"code": "missing_owner", "claim": "Третя дія"},
+                        ],
                     }
                 }),
                 encoding="utf-8",
@@ -86,6 +90,15 @@ class MeetingQualityTests(unittest.TestCase):
             ):
                 report = meeting_quality.finalize_quality_report(session)
             self.assertEqual(report["status"], "medium")
+            self.assertEqual(
+                [issue["code"] for issue in report["issues"]],
+                ["missing_owner"],
+            )
+            rendered = "\n".join(meeting_quality.report_note_lines(report))
+            self.assertEqual(
+                rendered.count("У деяких action items не визначено відповідального"),
+                1,
+            )
             self.assertTrue((work / "quality-report.json").is_file())
 
 
