@@ -1,14 +1,15 @@
 {
   "manifest_version": 3,
   "name": "Meeting Transcriber — Google Meet",
-  "version": "0.9.5",
+  "version": "0.10.0",
   "description": "Локально зберігає live captions із Google Meet.",
   "permissions": [
     "storage",
     "downloads"
   ],
   "host_permissions": [
-    "https://meet.google.com/*"
+    "https://meet.google.com/*",
+    "http://127.0.0.1:43119/*"
   ],
   "background": {
     "service_worker": "background.js"

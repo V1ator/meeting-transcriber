@@ -98,6 +98,11 @@
   background: #9da3ad;
 }
 
+#meeting-transcriber-widget[data-status="rtc-unavailable"] header i {
+  background: #ff6b6b;
+  box-shadow: 0 0 0 4px rgba(255, 107, 107, 0.14);
+}
+
 #meeting-transcriber-widget button {
   appearance: none;
   color: var(--mt-text);
@@ -143,6 +148,44 @@
 #meeting-transcriber-widget .mt-preview {
   max-height: 190px;
   overflow: auto;
+}
+
+#meeting-transcriber-widget .mt-warning[hidden] {
+  display: none;
+}
+
+#meeting-transcriber-widget .mt-warning {
+  display: grid;
+  gap: 7px;
+  margin-bottom: 10px;
+  padding: 10px;
+  color: #ffe8e8;
+  background: rgba(180, 48, 48, 0.18);
+  border: 1px solid rgba(255, 107, 107, 0.35);
+  border-radius: 9px;
+}
+
+#meeting-transcriber-widget .mt-warning strong {
+  font-size: 12px;
+}
+
+#meeting-transcriber-widget .mt-warning span {
+  color: #e4caca;
+  font-size: 11px;
+}
+
+#meeting-transcriber-widget .mt-warning button {
+  justify-self: start;
+  background: #8f3434;
+}
+
+#meeting-transcriber-widget .mt-warning button:hover {
+  background: #a64040;
+}
+
+#meeting-transcriber-widget .mt-warning button:disabled {
+  cursor: default;
+  opacity: 0.7;
 }
 
 #meeting-transcriber-widget .mt-preview:empty::before {

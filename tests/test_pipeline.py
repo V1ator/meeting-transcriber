@@ -224,6 +224,7 @@ class MicrophoneModeTests(unittest.TestCase):
     def test_paused_auto_start_keeps_manual_queue_without_polling_microphone(self):
         with (
             mock.patch.object(mic_watch, "MIC_AUTO_START", False),
+            mock.patch.object(mic_watch, "start_audio_control_server"),
             mock.patch.object(mic_watch, "consume_control_requests", return_value=0)
             as consume,
             mock.patch.object(mic_watch, "mic_in_use") as mic_in_use,
@@ -265,6 +266,38 @@ class MicrophoneModeTests(unittest.TestCase):
                 self.assertEqual(mic_watch.consume_control_requests(), 0)
             run.assert_not_called()
             self.assertFalse(request.exists())
+
+    def test_audio_control_enqueues_start_atomically(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            mic_watch, "REQUEST_DIR", Path(directory)
+        ):
+            request = mic_watch.enqueue_control_request("start")
+            self.assertEqual(request.read_text(encoding="utf-8"), "start\n")
+            self.assertEqual(request.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(list(Path(directory).glob("*.tmp")), [])
+
+    def test_audio_control_rejects_web_origins_and_wrong_header(self):
+        self.assertTrue(mic_watch.audio_control_authorized(
+            "chrome-extension://abcdefghijklmnop", mic_watch.AUDIO_CONTROL_HEADER
+        ))
+        self.assertFalse(mic_watch.audio_control_authorized(
+            "https://meet.google.com", mic_watch.AUDIO_CONTROL_HEADER
+        ))
+        self.assertFalse(mic_watch.audio_control_authorized(
+            "chrome-extension://abcdefghijklmnop", "wrong"
+        ))
+
+    def test_start_command_is_idempotent_when_recording_is_active(self):
+        with tempfile.TemporaryDirectory() as directory:
+            requests = Path(directory)
+            (requests / "1.request").write_text("start\n")
+            with (
+                mock.patch.object(mic_watch, "REQUEST_DIR", requests),
+                mock.patch.object(mic_watch, "recording_active", return_value=True),
+                mock.patch.object(mic_watch.subprocess, "run") as run,
+            ):
+                self.assertEqual(mic_watch.consume_control_requests(), 1)
+            run.assert_not_called()
 
     def test_cli_mode_overrides_env_fallback(self):
         with mock.patch.dict(

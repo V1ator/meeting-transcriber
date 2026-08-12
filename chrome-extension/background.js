@@ -1,6 +1,6 @@
 "use strict";
 
-importScripts("caption-model.js", "auto-export.js");
+importScripts("caption-model.js", "auto-export.js", "audio-control.js");
 
 const SETTINGS_KEY = "meeting-transcriber:settings";
 const TAB_KEY_PREFIX = "meeting-transcriber:tab:";
@@ -9,9 +9,39 @@ function tabKey(tabId) {
   return `${TAB_KEY_PREFIX}${tabId}`;
 }
 
-chrome.runtime.onMessage.addListener((message, sender) => {
+async function requestBackupAudio() {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 4_000);
+  try {
+    const response = await fetch(MeetingAudioControl.START_URL, {
+      ...MeetingAudioControl.startRequest(),
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      return { ok: false, error: `audio_control_${response.status}` };
+    }
+    const result = await response.json();
+    return result?.ok ? { ok: true } : { ok: false, error: "audio_not_queued" };
+  } catch (error) {
+    return {
+      ok: false,
+      error: error?.name === "AbortError" ? "audio_timeout" : "audio_unavailable",
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   const tabId = sender.tab?.id;
-  if (!Number.isInteger(tabId) || !message?.meetingCode) return;
+  if (!Number.isInteger(tabId)) return;
+
+  if (message?.type === "meeting-transcriber:start-backup-audio") {
+    requestBackupAudio().then(sendResponse);
+    return true;
+  }
+
+  if (!message?.meetingCode) return;
 
   if (message.type === "meeting-transcriber:register") {
     chrome.storage.session.set({

@@ -18,10 +18,14 @@
 
 import ctypes
 import datetime
+import json
 import os
+import secrets
 import subprocess
 import sys
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from pipeline_utils import load_dotenv
@@ -35,6 +39,9 @@ REQUEST_DIR = BASE / ".control" / "requests"
 REQUEST_MAX_AGE_SECONDS = 30
 POLL_SECONDS = 4
 CONTROL_POLL_SECONDS = 0.5
+AUDIO_CONTROL_HOST = "127.0.0.1"
+AUDIO_CONTROL_PORT = 43119
+AUDIO_CONTROL_HEADER = "audio-control-v1"
 DIALOG_TIMEOUT = 25  # с; нема відповіді = «ні»
 MIC_AUTO_START = os.environ.get("MIC_AUTO_START", "false").lower() == "true"
 AUDIO_PIPELINE_ENABLED = (
@@ -101,6 +108,117 @@ def recording_active() -> bool:
         return False
 
 
+def enqueue_control_request(command: str) -> Path:
+    """Atomically enqueue a narrowly-scoped local recorder command."""
+    if command not in {"toggle", "start"}:
+        raise ValueError(f"unknown audio command: {command!r}")
+    REQUEST_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    token = f"{time.time_ns()}.{os.getpid()}.{secrets.token_hex(6)}"
+    temporary = REQUEST_DIR / f".{token}.tmp"
+    request = REQUEST_DIR / f"{token}.request"
+    descriptor = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        0o600,
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(f"{command}\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, request)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return request
+
+
+def audio_control_authorized(origin: str, control_header: str) -> bool:
+    """Reject normal web-page requests; accept only the extension bridge."""
+    if control_header != AUDIO_CONTROL_HEADER:
+        return False
+    return not origin or origin.startswith("chrome-extension://")
+
+
+class AudioControlHandler(BaseHTTPRequestHandler):
+    """Minimal loopback bridge from the Meet widget to the command queue."""
+
+    server_version = "MeetingTranscriberAudio/1"
+
+    def log_message(self, _format: str, *_args: object) -> None:
+        return
+
+    def _send_json(self, status: int, payload: dict[str, object]) -> None:
+        encoded = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        origin = self.headers.get("Origin", "")
+        if origin.startswith("chrome-extension://"):
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def do_OPTIONS(self) -> None:  # noqa: N802 — BaseHTTPRequestHandler API
+        origin = self.headers.get("Origin", "")
+        requested = self.headers.get("Access-Control-Request-Headers", "").lower()
+        if (
+            not origin.startswith("chrome-extension://")
+            or "x-meeting-transcriber" not in requested
+        ):
+            self._send_json(403, {"ok": False})
+            return
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", origin)
+        self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
+        self.send_header(
+            "Access-Control-Allow-Headers", "X-Meeting-Transcriber, Content-Type"
+        )
+        self.send_header("Access-Control-Max-Age", "600")
+        self.end_headers()
+
+    def do_POST(self) -> None:  # noqa: N802 — BaseHTTPRequestHandler API
+        if self.path != "/recording/start":
+            self._send_json(404, {"ok": False, "error": "not_found"})
+            return
+        if not audio_control_authorized(
+            self.headers.get("Origin", ""),
+            self.headers.get("X-Meeting-Transcriber", ""),
+        ):
+            self._send_json(403, {"ok": False, "error": "forbidden"})
+            return
+        try:
+            content_length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            content_length = -1
+        if content_length < 0 or content_length > 1024:
+            self._send_json(413, {"ok": False, "error": "invalid_body"})
+            return
+        if content_length:
+            self.rfile.read(content_length)
+        enqueue_control_request("start")
+        self._send_json(202, {"ok": True, "queued": True})
+
+
+def start_audio_control_server() -> ThreadingHTTPServer | None:
+    """Start the private loopback endpoint without blocking the queue worker."""
+    try:
+        server = ThreadingHTTPServer(
+            (AUDIO_CONTROL_HOST, AUDIO_CONTROL_PORT), AudioControlHandler
+        )
+    except OSError as error:
+        log(f"audio control недоступний: {error}")
+        return None
+    server.daemon_threads = True
+    threading.Thread(
+        target=server.serve_forever,
+        name="audio-control",
+        daemon=True,
+    ).start()
+    log(f"audio control: http://{AUDIO_CONTROL_HOST}:{AUDIO_CONTROL_PORT}")
+    return server
+
+
 def consume_control_requests() -> int:
     """Виконує валідні команди SwiftBar у стабільному launchd-контексті."""
     REQUEST_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -113,8 +231,12 @@ def consume_control_requests() -> int:
             if age > REQUEST_MAX_AGE_SECONDS:
                 log(f"ігнорую застарілу control-команду ({age:.0f} с)")
                 continue
-            if command != "toggle":
+            if command not in {"toggle", "start"}:
                 log(f"ігнорую невідому control-команду: {command!r}")
+                continue
+            if command == "start" and recording_active():
+                log("ручна команда → запис уже активний")
+                handled += 1
                 continue
             log("ручна команда → toggle")
             subprocess.run([str(TOGGLE)], check=False)
@@ -158,6 +280,7 @@ def main() -> None:
         log("модуль audio вимкнено; фоновий процес не приймає команди")
         while True:
             time.sleep(3600)
+    start_audio_control_server()
     if not MIC_AUTO_START:
         log("моніторинг мікрофона на паузі; очікую лише ручні команди")
     # Перезапуск сервісу посеред дзвінка не повинен показувати новий popup.

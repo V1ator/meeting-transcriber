@@ -55,9 +55,14 @@
   let autoExportEnabled = true;
   let captureChat = true;
   let rtcCaptureEnabled = true;
+  let domFallbackEnabled = false;
   let rtcFallbackActive = false;
+  let rtcUnavailable = false;
   let rtcFallbackTimer = null;
   let rtcFallbackDeadline = 0;
+  let rtcFallbackRequiresReconnect = false;
+  let audioFallbackRequestState = "idle";
+  let audioFallbackResetTimer = null;
   let rtcStatus = {
     ready: false,
     channelState: "missing",
@@ -84,7 +89,9 @@
   const memoryStorage = {};
   const rtcSpeakerNames = new Map();
 
-  document.documentElement.classList.add(HIDE_NATIVE_CLASS);
+  // RTC is the default path. Never inherit native-caption hiding from a
+  // previous content-script instance unless diagnostic DOM capture is active.
+  document.documentElement.classList.remove(HIDE_NATIVE_CLASS);
 
   function currentMeetingCode() {
     const match = location.pathname.match(/^\/([a-z]{3}-[a-z]{4}-[a-z]{3})(?:\/|$)/i);
@@ -190,6 +197,7 @@
     autoExportEnabled = stored[SETTINGS_KEY]?.autoExportEnabled !== false;
     captureChat = stored[SETTINGS_KEY]?.captureChat !== false;
     rtcCaptureEnabled = stored[SETTINGS_KEY]?.rtcCaptureEnabled !== false;
+    domFallbackEnabled = stored[SETTINGS_KEY]?.domFallbackEnabled === true;
     const savedPosition = stored[SETTINGS_KEY]?.widgetPosition;
     if (Number.isFinite(savedPosition?.x) && Number.isFinite(savedPosition?.y)) {
       widgetPosition = { x: savedPosition.x, y: savedPosition.y };
@@ -205,6 +213,7 @@
         autoExportEnabled,
         captureChat,
         rtcCaptureEnabled,
+        domFallbackEnabled,
         widgetPosition,
       },
     });
@@ -338,8 +347,11 @@
         || !Number.isSafeInteger(messageVersion) || messageVersion < 0) return;
     if (!state.startedAt) startedEpoch = Date.now();
     rtcFallbackActive = false;
+    rtcUnavailable = false;
     rtcFallbackDeadline = 0;
+    rtcFallbackRequiresReconnect = false;
     clearTimeout(rtcFallbackTimer);
+    applyNativeCaptionVisibility();
     lastCaptionActivityEpoch = Date.now();
     const key = `rtc-${messageId}`;
     const item = Model.observeVersioned(state, {
@@ -360,11 +372,14 @@
     clearTimeout(rtcFallbackTimer);
     if (!rtcCaptureEnabled) return;
     const now = Date.now();
+    const effectiveDecoded = rtcFallbackRequiresReconnect
+      ? 0
+      : rtcStatus.decoded;
     rtcFallbackDeadline = RtcFallback.arm(
       rtcFallbackDeadline,
       now,
       RTC_FALLBACK_DELAY_MS,
-      rtcStatus.decoded,
+      effectiveDecoded,
       rtcStatus.channelState
     );
     if (!rtcFallbackDeadline) return;
@@ -372,14 +387,17 @@
       if (!RtcFallback.isDue(
         rtcFallbackDeadline,
         Date.now(),
-        rtcStatus.decoded,
+        rtcFallbackRequiresReconnect ? 0 : rtcStatus.decoded,
         rtcStatus.channelState
       )) {
         scheduleRtcFallback();
         return;
       }
-      rtcFallbackActive = true;
-      maybeEnableCaptions();
+      const recovery = RtcFallback.recovery(domFallbackEnabled);
+      rtcUnavailable = recovery.rtcUnavailable;
+      rtcFallbackActive = recovery.domFallbackActive;
+      applyNativeCaptionVisibility();
+      if (rtcFallbackActive) maybeEnableCaptions();
       render();
     }, Math.max(0, rtcFallbackDeadline - now));
   }
@@ -418,17 +436,24 @@
       detail.reason === "unsupported"
       || (detail.failures >= 3 && detail.decoded === 0)
     ) {
-      rtcFallbackActive = true;
+      const recovery = RtcFallback.recovery(domFallbackEnabled);
+      rtcUnavailable = recovery.rtcUnavailable;
+      rtcFallbackActive = recovery.domFallbackActive;
       rtcFallbackDeadline = 0;
       clearTimeout(rtcFallbackTimer);
-      maybeEnableCaptions();
+      applyNativeCaptionVisibility();
+      if (rtcFallbackActive) maybeEnableCaptions();
     } else if (["closed", "channel-error"].includes(detail.reason)) {
+      rtcFallbackRequiresReconnect = true;
       rtcCommand("retry");
       scheduleRtcFallback();
     } else if (detail.channelState === "open") {
       rtcFallbackActive = false;
+      rtcUnavailable = false;
       rtcFallbackDeadline = 0;
+      rtcFallbackRequiresReconnect = false;
       clearTimeout(rtcFallbackTimer);
+      applyNativeCaptionVisibility();
     }
     render();
   }
@@ -450,7 +475,10 @@
     ).find((candidate) => candidate.querySelector(ENTRY_SELECTOR)) || null;
     if (region) {
       region.setAttribute("data-meeting-transcriber-caption-region", "");
-      region.setAttribute("aria-hidden", hideNativeCaptions ? "true" : "false");
+      region.setAttribute(
+        "aria-hidden",
+        rtcFallbackActive && hideNativeCaptions ? "true" : "false"
+      );
       markCaptionSurface(region);
     }
     return region;
@@ -516,21 +544,39 @@
   }
 
   function applyNativeCaptionVisibility() {
+    const hideCaptions = domFallbackEnabled
+      && rtcFallbackActive
+      && hideNativeCaptions;
     document.documentElement.classList.toggle(
-      HIDE_NATIVE_CLASS, hideNativeCaptions
+      HIDE_NATIVE_CLASS, hideCaptions
     );
+    if (!domFallbackEnabled || !rtcFallbackActive) {
+      document.querySelectorAll(
+        `[data-meeting-transcriber-caption-region], `
+        + `[${CAPTION_HOST_MARKER}], [${CAPTION_SHELL_MARKER}]`
+      ).forEach((element) => {
+        element.setAttribute("aria-hidden", "false");
+        element.removeAttribute("data-meeting-transcriber-caption-region");
+        element.removeAttribute(CAPTION_HOST_MARKER);
+        element.removeAttribute(CAPTION_SHELL_MARKER);
+      });
+      clearLegacyMeetingLayoutOverrides();
+      return;
+    }
     const region = findCaptionRegion();
     if (region) {
-      region.setAttribute("aria-hidden", hideNativeCaptions ? "true" : "false");
+      region.setAttribute("aria-hidden", hideCaptions ? "true" : "false");
     }
     clearLegacyMeetingLayoutOverrides();
   }
 
   function scan() {
     if (paused || !state) return;
-    if (rtcCaptureEnabled && !rtcFallbackActive) {
+    if (!rtcFallbackActive) {
       setStatus(
-        rtcStatus.channelState === "open" || rtcStatus.decoded > 0
+        rtcUnavailable || !rtcCaptureEnabled
+          ? "rtc-unavailable"
+          : rtcStatus.channelState === "open" || rtcStatus.decoded > 0
           ? "capturing-rtc"
           : "connecting"
       );
@@ -644,6 +690,12 @@
   }
 
   function connectObserver() {
+    if (!domFallbackEnabled || !rtcFallbackActive) {
+      if (observer) observer.disconnect();
+      observer = null;
+      observedRegion = null;
+      return;
+    }
     const region = findCaptionRegion();
     if (region === observedRegion) return;
     if (observer) observer.disconnect();
@@ -658,7 +710,7 @@
   }
 
   function maybeEnableCaptions() {
-    if (rtcCaptureEnabled && !rtcFallbackActive) return;
+    if (!domFallbackEnabled || !rtcFallbackActive) return;
     const region = findCaptionRegion();
     if (region) {
       captionsWereEnabled = true;
@@ -886,6 +938,7 @@
       enabling: "Вмикаю CC…",
       capturing: "Запис captions",
       "capturing-rtc": "Запис RTC captions",
+      "rtc-unavailable": "RTC недоступний",
       paused: "Пауза",
     };
     root.querySelector("[data-role=status]").textContent =
@@ -926,9 +979,35 @@
       row.append(speaker, text);
       preview.append(row);
     });
-    if (rtcCaptureEnabled && !rtcFallbackActive) {
+    const rtcWarning = root.querySelector("[data-role=rtc-warning]");
+    const showRtcWarning = rtcUnavailable && !rtcFallbackActive;
+    rtcWarning.hidden = !showRtcWarning;
+    const audioButton = root.querySelector('[data-action="audio-fallback"]');
+    const audioMessage = root.querySelector("[data-role=audio-message]");
+    if (audioFallbackRequestState === "pending") {
+      audioButton.disabled = true;
+      audioButton.textContent = "Запускаю…";
+      audioMessage.textContent = "Надсилаю команду локальному аудіомодулю.";
+    } else if (audioFallbackRequestState === "sent") {
+      audioButton.disabled = true;
+      audioButton.textContent = "Запит надіслано";
+      audioMessage.textContent = "Підтвердьте режим запису у системному вікні.";
+    } else if (audioFallbackRequestState === "failed") {
+      audioButton.disabled = false;
+      audioButton.textContent = "Спробувати ще раз";
+      audioMessage.textContent =
+        "Локальний аудіомодуль недоступний. Скористайтеся звичним хоткеєм.";
+    } else {
+      audioButton.disabled = false;
+      audioButton.textContent = "Запустити аудіозапис";
+      audioMessage.textContent =
+        "Щоб не втратити зустріч, увімкніть резервний запис звуку.";
+    }
+    if (!rtcFallbackActive) {
       setStatus(
-        rtcStatus.channelState === "open" || rtcStatus.decoded > 0
+        rtcUnavailable || !rtcCaptureEnabled
+          ? "rtc-unavailable"
+          : rtcStatus.channelState === "open" || rtcStatus.decoded > 0
           ? "capturing-rtc"
           : "connecting"
       );
@@ -949,6 +1028,11 @@
       </header>
       <section>
         <div class="mt-meta"><span data-role="count">0 реплік</span><span data-role="activity">Очікую на текст</span></div>
+        <div class="mt-warning" data-role="rtc-warning" hidden>
+          <strong>RTC captions не підключилися</strong>
+          <span data-role="audio-message">Щоб не втратити зустріч, увімкніть резервний запис звуку.</span>
+          <button data-action="audio-fallback">Запустити аудіозапис</button>
+        </div>
         <div class="mt-preview" data-role="preview"></div>
         <div class="mt-actions">
           <button data-action="pause">Пауза</button>
@@ -965,9 +1049,30 @@
         paused = !paused;
         event.target.textContent = paused ? "Продовжити" : "Пауза";
         if (!paused) scan();
-        setStatus(findCaptionRegion() ? "capturing" : "waiting");
+        render();
       }
       if (action === "json") exportJson();
+      if (action === "audio-fallback") {
+        clearTimeout(audioFallbackResetTimer);
+        audioFallbackRequestState = "pending";
+        render();
+        try {
+          const response = await globalThis.chrome?.runtime?.sendMessage?.({
+            type: "meeting-transcriber:start-backup-audio",
+            meetingCode,
+          });
+          audioFallbackRequestState = response?.ok ? "sent" : "failed";
+        } catch {
+          audioFallbackRequestState = "failed";
+        }
+        render();
+        if (audioFallbackRequestState === "sent") {
+          audioFallbackResetTimer = setTimeout(() => {
+            audioFallbackRequestState = "idle";
+            render();
+          }, 30_000);
+        }
+      }
     });
     document.body.append(root);
     applyWidgetPosition(root);
@@ -993,8 +1098,11 @@
       rtcCommand("status");
       scheduleRtcFallback();
     } else {
-      rtcFallbackActive = true;
-      maybeEnableCaptions();
+      const recovery = RtcFallback.recovery(domFallbackEnabled);
+      rtcUnavailable = recovery.rtcUnavailable;
+      rtcFallbackActive = recovery.domFallbackActive;
+      applyNativeCaptionVisibility();
+      if (rtcFallbackActive) maybeEnableCaptions();
     }
     setInterval(() => {
       connectObserver();

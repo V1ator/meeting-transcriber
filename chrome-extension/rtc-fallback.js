@@ -15,5 +15,13 @@
       && deadline > 0 && now >= deadline;
   }
 
-  return { arm, isDue };
+  function recovery(domFallbackEnabled) {
+    return {
+      rtcUnavailable: true,
+      domFallbackActive: domFallbackEnabled === true,
+      backup: domFallbackEnabled === true ? "dom" : "audio",
+    };
+  }
+
+  return { arm, isDue, recovery };
 });
