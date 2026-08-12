@@ -521,6 +521,31 @@ class WatcherStateTests(unittest.TestCase):
         self.assertTrue(payload["think"])
         self.assertEqual(payload["options"]["num_predict"], 1234)
 
+    def test_ollama_logs_token_limit_done_reason(self):
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return json.dumps({
+                    "response": '{"items":[]}',
+                    "done_reason": "length",
+                    "eval_count": 4096,
+                }).encode()
+
+        output = io.StringIO()
+        with mock.patch.object(
+            watcher.urllib.request, "urlopen", return_value=Response()
+        ), mock.patch("sys.stdout", output):
+            watcher.ollama_generate("prompt", json_mode=True, num_predict=4096)
+        self.assertIn(
+            "done_reason=length, output_tokens=4096/4096",
+            output.getvalue(),
+        )
+
     def test_candidate_reasoning_is_reserved_for_final_assessment(self):
         with mock.patch.object(watcher, "CANDIDATE_OLLAMA_THINK", True):
             self.assertEqual(
@@ -863,6 +888,69 @@ class WatcherStateTests(unittest.TestCase):
         ledger, dropped = watcher._validated_evidence_ledger(raw, transcript)
         self.assertEqual(dropped, 0)
         self.assertEqual(ledger["items"][0]["evidence"][0]["timestamp"], "")
+        self.assertEqual(ledger["items"][0]["source_order"], 1)
+        self.assertEqual(
+            ledger["items"][0]["evidence"][0]["source_timestamp"], "00:10"
+        )
+
+    def test_evidence_validation_removes_unsupported_weekday_aside(self):
+        transcript = (
+            "[17:57:34] Oleh: Менеджерам зарезервувати слоти 14 та 15 числа."
+        )
+        raw = {"items": [{
+            "type": "commitment",
+            "claim": (
+                "Менеджерам зарезервувати слоти 14 та 15 числа "
+                "(понеділок і вівторок)"
+            ),
+            "owners": [],
+            "status": "open",
+            "commitment_strength": "explicit",
+            "evidence": [{
+                "timestamp": "17:57:34",
+                "quote": "Менеджерам зарезервувати слоти 14 та 15 числа",
+            }],
+        }]}
+        ledger, dropped = watcher._validated_evidence_ledger(raw, transcript)
+        self.assertEqual(dropped, 0)
+        self.assertEqual(
+            ledger["items"][0]["claim"],
+            "Менеджерам зарезервувати слоти 14 та 15 числа",
+        )
+        self.assertEqual(ledger["items"][0]["owners"], ["Hiring managers"])
+
+    def test_evidence_validation_removes_calendar_inconsistent_weekdays(self):
+        transcript = (
+            "- **Час початку:** 2026-08-11 17:31:00 CEST\n"
+            "[17:57:34] Oleh: Слоти 14 та 15 числа, понеділок і вівторок."
+        )
+        raw = {"items": [{
+            "type": "proposal",
+            "claim": "Залишити слоти 14 та 15 числа (понеділок і вівторок)",
+            "evidence": [{
+                "timestamp": "17:57:34",
+                "quote": "Слоти 14 та 15 числа, понеділок і вівторок",
+            }],
+        }]}
+        ledger, dropped = watcher._validated_evidence_ledger(raw, transcript)
+        self.assertEqual(dropped, 0)
+        self.assertEqual(
+            ledger["items"][0]["claim"], "Залишити слоти 14 та 15 числа"
+        )
+
+    def test_evidence_validation_drops_unsupported_number(self):
+        transcript = "[00:10] Максим: Треба провести співбесіди."
+        raw = {"items": [{
+            "type": "recommendation",
+            "claim": "Провести 20 співбесід",
+            "evidence": [{
+                "timestamp": "00:10",
+                "quote": "Треба провести співбесіди",
+            }],
+        }]}
+        ledger, dropped = watcher._validated_evidence_ledger(raw, transcript)
+        self.assertEqual(ledger, {"items": []})
+        self.assertEqual(dropped, 1)
 
     def test_commitment_owner_must_be_the_evidence_speaker(self):
         transcript = (
@@ -903,6 +991,112 @@ class WatcherStateTests(unittest.TestCase):
         ledger, _ = watcher._validated_evidence_ledger(raw, transcript)
         self.assertEqual(ledger["items"][0]["speaker"], "Current User")
         self.assertEqual(ledger["items"][0]["owners"], ["Current User"])
+
+    def test_commitment_infers_owner_from_first_person_evidence(self):
+        transcript = "[00:10] Current User: Я надішлю інструкцію завтра."
+        raw = {"items": [{
+            "type": "commitment",
+            "claim": "Надіслати інструкцію",
+            "owners": [],
+            "status": "open",
+            "commitment_strength": "explicit",
+            "evidence": [{
+                "timestamp": "00:10",
+                "quote": "Я надішлю інструкцію завтра",
+            }],
+        }]}
+        ledger, _ = watcher._validated_evidence_ledger(raw, transcript)
+        self.assertEqual(ledger["items"][0]["owners"], ["Current User"])
+
+    def test_unaccepted_advice_is_downgraded_from_decision(self):
+        item = {
+            "type": "decision",
+            "status": "active",
+            "claim": "Використовувати особисту історію як sales-аргумент",
+            "evidence": [{
+                "speaker": "Daria",
+                "quote": "Просто кажіть про свою особисту історію",
+            }],
+        }
+        normalized = watcher._normalize_evidence_lifecycle([item])
+        self.assertEqual(normalized[0]["type"], "proposal")
+        self.assertEqual(normalized[0]["status"], "open")
+
+    def test_conditional_future_does_not_turn_advice_into_decision(self):
+        item = {
+            "type": "decision",
+            "status": "active",
+            "claim": "Відповідати про FTC",
+            "evidence": [{
+                "speaker": "Ivan",
+                "quote": "Якщо будуть питати, то можна сказати, що все чесно",
+            }],
+        }
+        normalized = watcher._normalize_evidence_lifecycle([item])
+        self.assertEqual(normalized[0]["type"], "proposal")
+
+    def test_foreign_language_claim_falls_back_to_grounded_quote(self):
+        item = {
+            "type": "decision",
+            "status": "active",
+            "claim": "Olena will continue to assist with setup",
+            "evidence": [{
+                "quote": "Залишаємо допомогу Олени як резервний варіант",
+            }],
+        }
+        grounded = watcher._ground_claim_language([item])
+        self.assertEqual(
+            grounded[0]["claim"],
+            "Залишаємо допомогу Олени як резервний варіант",
+        )
+
+    def test_semantic_deduplication_collapses_offer_template(self):
+        first = {
+            "type": "proposal",
+            "status": "open",
+            "claim": "Створити шаблон оферу, де рекрутер підставляє ім'я",
+            "evidence": [{"quote": "зробити темплейт оферу", "source_line": 5}],
+        }
+        second = {
+            "type": "recommendation",
+            "status": "active",
+            "claim": "Створити шаблон офера, в якому рекрутер підставить ім'я",
+            "evidence": [{"quote": "зробити темплейт оферу", "source_line": 5}],
+        }
+        deduplicated = watcher._deduplicate_evidence_items([first, second])
+        self.assertEqual(len(deduplicated), 1)
+        self.assertEqual(deduplicated[0]["type"], "proposal")
+
+    def test_same_quote_cannot_support_two_commitments(self):
+        first = {
+            "type": "commitment",
+            "status": "open",
+            "claim": "Надіслати комс-гайд",
+            "evidence": [{"quote": "да зроблю", "source_line": 146}],
+        }
+        second = {
+            "type": "commitment",
+            "status": "open",
+            "claim": "Share the company guide in chat",
+            "evidence": [{"quote": "да зроблю", "source_line": 146}],
+        }
+        self.assertEqual(
+            len(watcher._deduplicate_evidence_items([first, second])), 1
+        )
+
+    def test_closing_excerpt_selects_last_eight_minutes(self):
+        transcript = "\n".join([
+            "# Meeting",
+            "[17:31:00] A: Початок",
+            "[17:55:00] B: Проміжний варіант",
+            "[18:02:30] A: Фінальний підсумок",
+            "[18:10:00] B: Завершення",
+        ])
+        excerpt = watcher._closing_transcript_excerpt(transcript)
+        self.assertNotIn("Початок", excerpt)
+        self.assertNotIn("Проміжний варіант", excerpt)
+        self.assertIn("Фінальний підсумок", excerpt)
+        self.assertIn("Завершення", excerpt)
 
     def test_context_generation_cannot_bypass_decision_reconciliation(self):
         transcript = "[00:10] Максим: Домовились почати з ринку США."
@@ -945,14 +1139,21 @@ class WatcherStateTests(unittest.TestCase):
                 stage="context evidence merge",
                 num_predict=4096,
                 allowed_types=watcher.CONTEXT_EVIDENCE_TYPES,
+                repair_item_limit=5,
             )
         self.assertEqual(ledger, {"items": []})
         self.assertEqual(
             [call.kwargs["num_predict"] for call in generate.call_args_list],
             [4096, 4096],
         )
+        self.assertIn(
+            "не більше 5 найважливіших items",
+            generate.call_args_list[1].args[0],
+        )
 
     def test_critical_merge_has_larger_output_budget(self):
+        self.assertEqual(watcher.SUMMARY_CONTEXT_NUM_PREDICT, 4096)
+        self.assertEqual(watcher.SUMMARY_CONTEXT_REPAIR_ITEMS, 5)
         self.assertEqual(watcher.SUMMARY_CRITICAL_MERGE_NUM_PREDICT, 8192)
         self.assertEqual(watcher.SUMMARY_CRITICAL_RECONCILE_NUM_PREDICT, 8192)
 
@@ -1011,6 +1212,37 @@ class WatcherStateTests(unittest.TestCase):
         self.assertIn("дедлайн: наступного тижня", actions)
         self.assertNotIn("США", decisions)
         self.assertNotIn("Meta Ads Library", actions)
+
+    def test_grounded_sections_keep_proposals_out_of_open_questions(self):
+        ledger = {"items": [
+            {
+                "type": "proposal",
+                "status": "open",
+                "claim": "Підготувати QR-коди для нетворкінгу",
+            },
+            {
+                "type": "open_question",
+                "status": "open",
+                "claim": "Чи буде інтернатура?",
+            },
+            {
+                "type": "commitment",
+                "status": "open",
+                "claim": "Підготувати групове завдання",
+                "owners": [],
+                "deadline": "",
+            },
+        ]}
+        summary = watcher._render_grounded_sections(
+            watcher.SUMMARY_TEMPLATE, ledger
+        )
+        theses = watcher._summary_section(summary, "## Основні тези")
+        questions = watcher._summary_section(summary, "## Відкриті питання")
+        actions = watcher._summary_section(summary, "## Action items")
+        self.assertIn("Пропозиція: Підготувати QR-коди", theses)
+        self.assertNotIn("QR-коди", questions)
+        self.assertEqual(questions, "- Чи буде інтернатура?")
+        self.assertIn("[Власник не визначений]", actions)
 
     def test_summary_builds_and_persists_evidence_ledger(self):
         transcript = "[00:10] Інтерв’юер: Домовились проводити щотижневий sync."
