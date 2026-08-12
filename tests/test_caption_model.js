@@ -74,6 +74,29 @@ test("RTC keeps the highest message version", () => {
   assert.equal(current.sourceVersions[base.key], 3);
 });
 
+test("RTC speaker identity survives versions and state restoration", () => {
+  const current = state();
+  Model.observeVersioned(current, {
+    key: "rtc-message-1",
+    version: 1,
+    speaker: "Учасник 116",
+    speakerId: "devices/116",
+    text: "Початок",
+    atMs: 1_000,
+  });
+  Model.observeVersioned(current, {
+    key: "rtc-message-1",
+    version: 2,
+    speaker: "Олег",
+    speakerId: "devices/116",
+    text: "Початок зустрічі",
+    atMs: 2_000,
+  });
+  const restored = Model.createState(JSON.parse(JSON.stringify(current)));
+  assert.equal(restored.entries[0].speakerId, "devices/116");
+  assert.equal(Model.compactEntries(restored.entries)[0].speakerId, "devices/116");
+});
+
 test("duplicate RTC packets for one message create one entry", () => {
   const current = state();
   const packet = {
@@ -207,4 +230,18 @@ test("export preserves raw RTC turns and deduplicates exact chat", () => {
   ]);
   assert.equal(exported.entries[2].kind, "chat");
   assert.deepEqual(exported.participants, ["Олег", "Марія"]);
+});
+
+test("export includes a capture health snapshot", () => {
+  const current = state();
+  current.captureHealth = {
+    rtcOpenedAtMs: 1_200,
+    disconnectCount: 1,
+  };
+  const exported = Model.exportState(current, "2026-08-12T10:30:00.000Z");
+  assert.deepEqual(exported.captureHealth, {
+    rtcOpenedAtMs: 1_200,
+    disconnectCount: 1,
+    exportedAt: "2026-08-12T10:30:00.000Z",
+  });
 });

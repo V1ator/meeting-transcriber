@@ -701,6 +701,9 @@ class WatcherStateTests(unittest.TestCase):
                     mock.patch("notion_agent.sync_note_if_enabled"):
                 note = audio.create_note_from_transcript("session", transcript)
             self.assertTrue(note.is_file())
+            note_text = note.read_text(encoding="utf-8")
+            self.assertIn("- **Тип зустрічі:** Дослідження / інтерв’ю", note_text)
+            self.assertIn("- **Якість:** Середня", note_text)
             candidate_flow.assert_not_called()
 
     def test_refresh_note_replaces_transcript_and_collapsed_speaker_mapping(self):

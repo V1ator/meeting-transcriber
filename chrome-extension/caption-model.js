@@ -53,6 +53,9 @@
       endedAt: source.endedAt || null,
       participants: [],
       entries,
+      captureHealth: source.captureHealth && typeof source.captureHealth === "object"
+        ? { ...source.captureHealth }
+        : {},
       activeKeys: source.activeKeys && typeof source.activeKeys === "object"
         ? { ...source.activeKeys } : {},
       sourceKeys: source.sourceKeys && typeof source.sourceKeys === "object"
@@ -159,6 +162,7 @@
         text,
         kind,
         captureSource: "rtc",
+        speakerId: normalizeText(observation.speakerId),
         startMs: atMs,
         endMs: atMs,
         final: false,
@@ -169,6 +173,7 @@
       entry.text = text;
       entry.kind = kind;
       entry.captureSource = "rtc";
+      entry.speakerId = normalizeText(observation.speakerId) || entry.speakerId || "";
       entry.endMs = Math.max(entry.endMs, atMs);
       entry.final = false;
     }
@@ -208,12 +213,20 @@
         if (exactChats.has(key)) return;
         exactChats.add(key);
       }
-      result.push({ speaker, text, kind, startMs, endMs });
+      result.push({
+        speaker,
+        text,
+        kind,
+        startMs,
+        endMs,
+        ...(source?.speakerId ? { speakerId: normalizeText(source.speakerId) } : {}),
+      });
     });
     return result;
   }
 
   function exportState(state, endedAt) {
+    const exportedAt = endedAt || new Date().toISOString();
     const participants = [];
     const participantState = { participants };
     (state.participants || []).forEach(
@@ -230,7 +243,12 @@
       meetingTitle: state.meetingTitle,
       participants,
       language: state.language,
-      endedAt: endedAt || new Date().toISOString(),
+      endedAt: exportedAt,
+      captureHealth: {
+        ...(state.captureHealth && typeof state.captureHealth === "object"
+          ? state.captureHealth : {}),
+        exportedAt,
+      },
       entries: compactEntries(state.entries).map((entry) => ({
         speaker: entry.speaker,
         text: entry.text,

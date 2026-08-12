@@ -168,9 +168,22 @@
   border-top: 1px solid rgba(255, 255, 255, 0.07);
 }
 
-#meeting-transcriber-widget .mt-preview strong {
+#meeting-transcriber-widget .mt-preview .mt-speaker {
+  justify-self: start;
+  padding: 0;
   color: #a9c7ff;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
   font-size: 11px;
+  font-weight: 700;
+  text-align: left;
+}
+
+#meeting-transcriber-widget .mt-preview .mt-speaker:hover {
+  color: #d5e3ff;
+  background: transparent;
+  text-decoration: underline;
 }
 
 #meeting-transcriber-widget .mt-preview span {

@@ -40,12 +40,25 @@
   }
 
   function signature(exported) {
+    const health = exported?.captureHealth || {};
     return JSON.stringify({
       meetingCode: exported?.meetingCode || "",
       startedAt: exported?.startedAt || "",
       meetingTitle: exported?.meetingTitle || "",
       participants: exported?.participants || [],
       entries: exported?.entries || [],
+      captureHealth: {
+        rtcOpenedAtMs: health.rtcOpenedAtMs || 0,
+        firstCaptionMs: health.firstCaptionMs || 0,
+        lastCaptionMs: health.lastCaptionMs || 0,
+        decodedCaptions: health.decodedCaptions || 0,
+        decodeFailures: health.decodeFailures || 0,
+        disconnectCount: health.disconnectCount || 0,
+        hadRtcUnavailable: Boolean(health.hadRtcUnavailable),
+        recovered: Boolean(health.recovered),
+        lastFailureReason: health.lastFailureReason || "",
+        channelState: health.channelState || "",
+      },
     });
   }
 

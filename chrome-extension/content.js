@@ -12,6 +12,7 @@
   const RTC_COMMAND_NAME = "meeting-transcriber:rtc-command";
   const RTC_SESSION_NONCE = globalThis.crypto.randomUUID();
   const WIDGET_EDGE_MARGIN = 8;
+  const MAX_SPEAKER_ALIASES = 500;
   const CHAT_TEXT_SELECTOR =
     ".oIy2qc, [data-meeting-transcriber-chat-text]";
   const CHAT_SPEAKER_SELECTOR =
@@ -34,6 +35,8 @@
   let startedEpoch = Date.now();
   let autoExportEnabled = true;
   let captureChat = true;
+  let speakerAliases = {};
+  let speakerNameAliases = {};
   let rtcUnavailable = false;
   let rtcFallbackTimer = null;
   let rtcFallbackDeadline = 0;
@@ -140,6 +143,52 @@
     return Math.max(0, Date.now() - startedEpoch);
   }
 
+  function sanitizedAliasMap(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+    return Object.fromEntries(Object.entries(value)
+      .slice(-MAX_SPEAKER_ALIASES)
+      .map(([key, name]) => [String(key).slice(0, 500), Model.cleanSpeaker(name)])
+      .filter(([key, name]) => (
+        safeAliasKey(key) && name !== "Невідомий"
+      )));
+  }
+
+  function safeAliasKey(value) {
+    const key = String(value || "");
+    return Boolean(key) && !["__proto__", "prototype", "constructor"].includes(key);
+  }
+
+  function speakerNameKey(value) {
+    return Model.cleanSpeaker(value).toLocaleLowerCase();
+  }
+
+  function canonicalSpeakerName(value) {
+    const cleaned = Model.cleanSpeaker(value);
+    return speakerNameAliases[speakerNameKey(cleaned)] || cleaned;
+  }
+
+  function captureHealth() {
+    if (!state.captureHealth || typeof state.captureHealth !== "object") {
+      state.captureHealth = {};
+    }
+    return state.captureHealth;
+  }
+
+  function refreshCaptureHealth() {
+    const health = captureHealth();
+    health.channelState = rtcStatus.channelState;
+    health.decodedCaptions = Math.max(
+      Number(health.decodedCaptions) || 0,
+      Number(rtcStatus.decoded) || 0
+    );
+    health.decodeFailures = Math.max(
+      Number(health.decodeFailures) || 0,
+      Number(rtcStatus.failures) || 0
+    );
+    health.finalizedAtMs = elapsedMs();
+    return health;
+  }
+
   async function loadState() {
     const stored = await storageGet([storageKey(), SETTINGS_KEY]);
     let seed = stored[storageKey()] || {};
@@ -149,6 +198,14 @@
       seed = {};
       await storageRemove(storageKey());
     }
+    speakerAliases = sanitizedAliasMap(stored[SETTINGS_KEY]?.speakerAliases);
+    speakerNameAliases = sanitizedAliasMap(
+      stored[SETTINGS_KEY]?.speakerNameAliases
+    );
+    rtcSpeakerNames.clear();
+    Object.entries(speakerAliases).forEach(([deviceId, name]) => {
+      rtcSpeakerNames.set(deviceId, canonicalSpeakerName(name));
+    });
     state = Model.createState({
       ...seed,
       meetingCode,
@@ -161,6 +218,16 @@
     }
     autoExportEnabled = stored[SETTINGS_KEY]?.autoExportEnabled !== false;
     captureChat = stored[SETTINGS_KEY]?.captureChat !== false;
+    const knownParticipants = (state.participants || []).map(canonicalSpeakerName);
+    state.entries.forEach((entry) => {
+      const alias = entry.speakerId
+        ? rtcSpeakerNames.get(normalizeRtcDeviceId(entry.speakerId))
+        : null;
+      entry.speaker = alias || canonicalSpeakerName(entry.speaker);
+    });
+    state.participants = [];
+    knownParticipants.forEach((name) => Model.addParticipant(state, name));
+    state.entries.forEach((entry) => Model.addParticipant(state, entry.speaker));
     const savedPosition = stored[SETTINGS_KEY]?.widgetPosition;
     if (Number.isFinite(savedPosition?.x) && Number.isFinite(savedPosition?.y)) {
       widgetPosition = { x: savedPosition.x, y: savedPosition.y };
@@ -172,6 +239,8 @@
       [SETTINGS_KEY]: {
         autoExportEnabled,
         captureChat,
+        speakerAliases,
+        speakerNameAliases,
         widgetPosition,
       },
     });
@@ -219,23 +288,95 @@
     return `Учасник ${String(tail || normalized).slice(-6)}`;
   }
 
+  function rememberDeviceAlias(deviceId, name) {
+    const normalized = normalizeRtcDeviceId(deviceId);
+    const tail = normalized.split("/").pop();
+    let changed = false;
+    [normalized, tail].filter(safeAliasKey).forEach((key) => {
+      if (speakerAliases[key] === name) return;
+      speakerAliases[key] = name;
+      changed = true;
+    });
+    if (Object.keys(speakerAliases).length > MAX_SPEAKER_ALIASES) {
+      speakerAliases = Object.fromEntries(
+        Object.entries(speakerAliases).slice(-MAX_SPEAKER_ALIASES)
+      );
+    }
+    if (changed) scheduleSettingsSave();
+  }
+
   function registerRtcSpeaker(deviceId, name) {
     const normalized = normalizeRtcDeviceId(deviceId);
-    const cleaned = Model.cleanSpeaker(name);
+    const cleaned = canonicalSpeakerName(name);
     if (!normalized || cleaned === "Невідомий") return false;
     const fallbackName = fallbackNameForDevice(normalized);
+    const tail = normalized.split("/").pop();
     rtcSpeakerNames.set(normalized, cleaned);
-    rtcSpeakerNames.set(normalized.split("/").pop(), cleaned);
+    rtcSpeakerNames.set(tail, cleaned);
+    rememberDeviceAlias(normalized, cleaned);
     if (state) {
+      let changed = false;
       state.entries.forEach((entry) => {
-        if (entry.speaker === fallbackName) entry.speaker = cleaned;
+        const entryDevice = normalizeRtcDeviceId(entry.speakerId);
+        if (
+          entry.speaker !== cleaned
+          && (
+            entry.speaker === fallbackName
+            || entryDevice === normalized
+            || (tail && entryDevice.split("/").pop() === tail)
+          )
+        ) {
+          entry.speaker = cleaned;
+          changed = true;
+        }
       });
+      const participantCount = (state.participants || []).length;
       state.participants = (state.participants || []).filter(
-        (participant) => participant !== fallbackName
+        (participant) => speakerNameKey(participant) !== speakerNameKey(fallbackName)
       );
-      Model.addParticipant(state, cleaned);
-      scheduleSave();
+      changed = state.participants.length !== participantCount
+        || Model.addParticipant(state, cleaned)
+        || changed;
+      if (changed) {
+        state.revision += 1;
+        scheduleSave();
+      }
     }
+    return true;
+  }
+
+  function renameSpeaker(speakerId, currentName, requestedName) {
+    const cleaned = Model.cleanSpeaker(requestedName);
+    const previous = Model.cleanSpeaker(currentName);
+    if (
+      cleaned === "Невідомий"
+      || speakerNameKey(cleaned) === speakerNameKey(previous)
+    ) return false;
+    const previousKey = speakerNameKey(previous);
+    if (!/^Учасник\s+\S+/iu.test(previous) && safeAliasKey(previousKey)) {
+      speakerNameAliases[previousKey] = cleaned;
+    }
+    if (Object.keys(speakerNameAliases).length > MAX_SPEAKER_ALIASES) {
+      speakerNameAliases = Object.fromEntries(
+        Object.entries(speakerNameAliases).slice(-MAX_SPEAKER_ALIASES)
+      );
+    }
+    if (speakerId) registerRtcSpeaker(speakerId, cleaned);
+    state.entries.forEach((entry) => {
+      if (
+        entry.speaker === previous
+        || (speakerId && normalizeRtcDeviceId(entry.speakerId)
+          === normalizeRtcDeviceId(speakerId))
+      ) entry.speaker = cleaned;
+    });
+    state.participants = (state.participants || []).filter(
+      (participant) => speakerNameKey(participant) !== speakerNameKey(previous)
+    );
+    Model.addParticipant(state, cleaned);
+    state.revision += 1;
+    scheduleSettingsSave();
+    scheduleSave();
+    render();
     return true;
   }
 
@@ -268,7 +409,7 @@
     const cleaned = Model.cleanSpeaker(name);
     if (cleaned === "Невідомий") return fallbackName;
     registerRtcSpeaker(normalized, cleaned);
-    return cleaned;
+    return canonicalSpeakerName(cleaned);
   }
 
   function processRtcCaption(message) {
@@ -286,13 +427,23 @@
     rtcFallbackRequiresReconnect = false;
     clearTimeout(rtcFallbackTimer);
     lastCaptionActivityEpoch = Date.now();
+    const atMs = elapsedMs();
+    const health = captureHealth();
+    if (!Number.isFinite(health.firstCaptionMs)) health.firstCaptionMs = atMs;
+    health.lastCaptionMs = atMs;
+    health.decodedCaptions = Math.max(
+      Number(health.decodedCaptions) || 0,
+      Number(rtcStatus.decoded) || 0,
+    );
+    if (health.hadRtcUnavailable) health.recovered = true;
     const key = `rtc-${messageId}`;
     const item = Model.observeVersioned(state, {
       key,
       version: messageVersion,
       speaker: participantNameForDevice(deviceId),
+      speakerId: deviceId,
       text,
-      atMs: elapsedMs(),
+      atMs,
       observedAt: new Date().toISOString(),
     });
     if (!item) return;
@@ -326,6 +477,10 @@
         return;
       }
       rtcUnavailable = true;
+      const health = captureHealth();
+      health.hadRtcUnavailable = true;
+      health.lastFailureReason = "startup-timeout";
+      scheduleSave();
       render();
     }, Math.max(0, rtcFallbackDeadline - now));
   }
@@ -354,29 +509,47 @@
       return;
     }
     if (detail.type !== "status") return;
+    const previousChannelState = rtcStatus.channelState;
     rtcStatus = {
       ...rtcStatus,
       ...detail,
       ready: rtcStatus.ready,
       reason: detail.reason || "",
     };
+    const health = captureHealth();
+    health.channelState = rtcStatus.channelState;
+    health.decodeFailures = Math.max(
+      Number(health.decodeFailures) || 0,
+      Number(detail.failures) || 0,
+    );
     if (
       detail.reason === "unsupported"
       || (detail.failures >= 3 && detail.decoded === 0)
     ) {
       rtcUnavailable = true;
+      health.hadRtcUnavailable = true;
+      health.lastFailureReason = detail.reason || "decode-failures";
       rtcFallbackDeadline = 0;
       clearTimeout(rtcFallbackTimer);
     } else if (["closed", "channel-error"].includes(detail.reason)) {
+      if (previousChannelState === "open") {
+        health.disconnectCount = (Number(health.disconnectCount) || 0) + 1;
+      }
+      health.lastFailureReason = detail.reason;
       rtcFallbackRequiresReconnect = true;
       rtcCommand("retry");
       scheduleRtcFallback();
     } else if (detail.channelState === "open") {
+      if (!Number.isFinite(health.rtcOpenedAtMs)) {
+        health.rtcOpenedAtMs = elapsedMs();
+      }
+      if (health.hadRtcUnavailable) health.recovered = true;
       rtcUnavailable = false;
       rtcFallbackDeadline = 0;
       rtcFallbackRequiresReconnect = false;
       clearTimeout(rtcFallbackTimer);
     }
+    scheduleSave();
     render();
   }
 
@@ -393,10 +566,12 @@
       const container = textNode.closest(CHAT_CONTAINER_SELECTOR)
         || textNode.parentElement;
       const speakerNode = container?.querySelector(CHAT_SPEAKER_SELECTOR);
-      const speaker = speakerNode?.getAttribute("data-sender-name")
-        || speakerNode?.textContent;
+      const speaker = canonicalSpeakerName(
+        speakerNode?.getAttribute("data-sender-name")
+        || speakerNode?.textContent
+      );
       const text = textNode.textContent;
-      if (!speaker || !Model.normalizeText(text)) return;
+      if (speaker === "Невідомий" || !Model.normalizeText(text)) return;
       const semanticKey = chatMessageKey(container, Model.cleanSpeaker(speaker), text);
       if (chatSeenKeys.has(semanticKey)) return;
       chatSeenKeys.add(semanticKey);
@@ -432,7 +607,7 @@
         || element.getAttribute("data-self-name")
         || element.getAttribute("data-meeting-transcriber-participant-name")
         || element.textContent;
-      if (Model.addParticipant(state, name)) changed = true;
+      if (Model.addParticipant(state, canonicalSpeakerName(name))) changed = true;
     });
     document.querySelectorAll(PARTICIPANT_CONTAINER_SELECTOR).forEach((container) => {
       const named = container.matches(PARTICIPANT_NAME_SELECTOR)
@@ -444,7 +619,7 @@
         || named?.getAttribute("data-meeting-transcriber-participant-name")
         || named?.textContent
         || avatar?.getAttribute("alt");
-      if (Model.addParticipant(state, name)) changed = true;
+      if (Model.addParticipant(state, canonicalSpeakerName(name))) changed = true;
     });
     if (changed) scheduleSave();
   }
@@ -486,6 +661,7 @@
   function exportJson() {
     scanChat();
     scanParticipants();
+    refreshCaptureHealth();
     downloadJsonExport(Model.exportState(state));
   }
 
@@ -493,6 +669,7 @@
     if (!autoExportEnabled || !state) return false;
     scanChat();
     scanParticipants();
+    refreshCaptureHealth();
     const exported = Model.exportState(state);
     if (!exported.entries.length) return false;
     const signature = AutoExport.signature(exported);
@@ -640,7 +817,13 @@
     preview.replaceChildren();
     visibleEntries.slice(-4).forEach((entry) => {
       const row = document.createElement("div");
-      const speaker = document.createElement("strong");
+      const speaker = document.createElement("button");
+      speaker.type = "button";
+      speaker.className = "mt-speaker";
+      speaker.dataset.action = "rename-speaker";
+      speaker.dataset.speaker = entry.speaker;
+      speaker.dataset.speakerId = entry.speakerId || "";
+      speaker.title = "Натисніть, щоб виправити ім’я";
       speaker.textContent = entry.kind === "chat"
         ? `${entry.speaker} (chat)`
         : entry.speaker;
@@ -706,6 +889,21 @@
       </section>`;
     root.addEventListener("click", async (event) => {
       const action = event.target.closest("button")?.dataset.action;
+      if (action === "rename-speaker") {
+        const button = event.target.closest("button");
+        const requested = globalThis.prompt?.(
+          "Ім’я учасника",
+          button.dataset.speaker || ""
+        );
+        if (requested) {
+          renameSpeaker(
+            button.dataset.speakerId || "",
+            button.dataset.speaker || "",
+            requested
+          );
+        }
+        return;
+      }
       if (action === "collapse") {
         root.classList.toggle("collapsed");
         if (widgetPosition) applyWidgetPosition(root);

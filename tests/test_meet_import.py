@@ -23,6 +23,11 @@ def sample_export() -> dict:
         "language": "uk",
         "startedAt": "2026-07-28T08:00:00.000Z",
         "endedAt": "2026-07-28T08:30:00.000Z",
+        "captureHealth": {
+            "rtcOpenedAtMs": 1_200,
+            "decodedCaptions": 3,
+            "channelState": "open",
+        },
         "entries": [
             {
                 "speaker": "Інтерв’юер",
@@ -404,6 +409,10 @@ class MeetImportTests(unittest.TestCase):
             )
             self.assertEqual(manifest["source"], "google-meet-live-captions")
             self.assertEqual(manifest["quality"]["segments"], 2)
+            self.assertEqual(manifest["capture_quality"]["status"], "high")
+            self.assertTrue(
+                (transcripts / result.stem / "capture-quality.json").is_file()
+            )
 
     def test_summary_path_uses_shared_note_builder(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -17,7 +17,9 @@ from pathlib import Path
 from typing import Any
 
 import paths as project_paths
+import meeting_templates
 import summary_pipeline as summary_pipeline
+from meeting_quality import finalize_quality_report, report_note_lines
 from pipeline_utils import (
     atomic_write_json,
     atomic_write_text,
@@ -188,22 +190,6 @@ def _ensure_manifest(session: str) -> dict:
     }
     atomic_write_json(path, manifest)
     return manifest
-
-
-def _quality_warning(session: str) -> str | None:
-    transcript_manifest = read_json(project_paths.TRANSCRIPTS / session / "manifest.json", {}) or {}
-    quality = transcript_manifest.get("quality") or {}
-    ratio = float(quality.get("unknown_speaker_ratio", 0) or 0)
-    local_ratio = float(quality.get("local_unknown_speaker_ratio", 0) or 0)
-    scale = float((quality.get("sync") or {}).get("scale", 1) or 1)
-    warnings = []
-    if ratio > 0.15:
-        warnings.append(f"{ratio:.0%} реплік співрозмовників без speaker label")
-    if local_ratio > 0.15:
-        warnings.append(f"{local_ratio:.0%} локальних реплік без speaker label")
-    if abs(scale - 1.0) > 0.005:
-        warnings.append(f"значна корекція clock drift: ×{scale:.6f}")
-    return "; ".join(warnings) if warnings else None
 
 
 def _write_short_note(session: str, duration: float) -> Path:
@@ -420,12 +406,24 @@ def create_note_from_transcript(session: str, transcript: str) -> Path:
     meeting_date, meeting_time, meeting_title, participants = (
         _meeting_note_metadata(session, transcript, title)
     )
+    meeting_type = meeting_templates.detect_meeting_type(
+        meeting_title, transcript
+    )
+    quality_report = finalize_quality_report(session)
+    transcript_manifest = project_paths.TRANSCRIPTS / session / "manifest.json"
+    if transcript_manifest.exists():
+        update_manifest(transcript_manifest, meeting_type=meeting_type)
+    processing_manifest = manifest_path(session)
+    if processing_manifest.exists():
+        update_manifest(processing_manifest, meeting_type=meeting_type)
     header = [
         f"# {title or meeting_title}",
         "",
         f"- **Дата:** {meeting_date}",
         f"- **Час:** {meeting_time}",
         f"- **Назва зустрічі:** {meeting_title}",
+        f"- **Тип зустрічі:** {meeting_templates.meeting_type_label(meeting_type)}",
+        *report_note_lines(quality_report),
         "",
         "**Присутні:**",
         *(f"- {participant}" for participant in participants),
@@ -433,9 +431,6 @@ def create_note_from_transcript(session: str, transcript: str) -> Path:
     if not participants:
         header.append("- —")
     header.append("")
-    warning = _quality_warning(session)
-    if warning:
-        header += [f"> ⚠️ Автоматична перевірка якості: {warning}.", ""]
     speakers = sorted(set(re.findall(
         r"(?:SPEAKER|LOCAL)_\d+|LOCAL_UNKNOWN|UNKNOWN", transcript
     )))
@@ -751,16 +746,26 @@ def refresh_summary_render(session: str) -> Path:
     if quality["status"] != "pass":
         raise ValueError("Summary quality gate не пройдено під час refresh")
     _, _, meeting_title, _ = _meeting_note_metadata(session, transcript, "")
+    meeting_type = meeting_templates.detect_meeting_type(
+        meeting_title, transcript
+    )
     summary_title = str(cache.get("title", "")).strip() or meeting_title
     summary = _render_grounded_sections(
         SUMMARY_TEMPLATE, ledger, meeting_title=summary_title
     )
-    if not _valid_summary(summary):
+    template_section = meeting_templates.render_template_section(
+        meeting_type, ledger
+    )
+    if template_section:
+        summary = f"{summary.rstrip()}\n\n{template_section}"
+    if not _valid_summary(summary, meeting_type):
         raise ValueError("Оновлений summary не пройшов structural validation")
 
     meta = {
-        "schema_version": 8,
+        "schema_version": 9,
         "prompt_fingerprint": PROMPT_FINGERPRINT,
+        "meeting_template_version": meeting_templates.TEMPLATE_VERSION,
+        "meeting_type": meeting_type,
         "model": OLLAMA_MODEL,
         "num_ctx": OLLAMA_NUM_CTX,
         "extract_think": SUMMARY_EXTRACT_THINK,

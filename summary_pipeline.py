@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 import paths as project_paths
+import meeting_templates
 from urllib.parse import urlparse
 
 from pipeline_utils import (
@@ -257,9 +258,13 @@ def ollama_generate(
     raise last_error
 
 
-def _valid_summary(summary: str) -> bool:
+def _valid_summary(summary: str, meeting_type: str = "general") -> bool:
     headings = re.findall(r"^## .+$", summary, flags=re.MULTILINE)
-    if headings != list(REQUIRED_HEADINGS):
+    expected_headings = list(REQUIRED_HEADINGS)
+    extra_heading = meeting_templates.template_heading(meeting_type)
+    if extra_heading:
+        expected_headings.append(extra_heading)
+    if headings != expected_headings:
         return False
     action_section = _summary_section(summary, "## Action items")
     action_lines = [line for line in action_section.splitlines() if line.strip()]
@@ -1262,9 +1267,15 @@ def summarize(session: str, transcript: str) -> str:
     work_dir = project_paths.TRANSCRIPTS / session
     cache_path = work_dir / "summary-cache.json"
     evidence_path = work_dir / "summary-evidence.json"
+    meeting_title = _transcript_meeting_title(transcript)
+    meeting_type = meeting_templates.detect_meeting_type(
+        meeting_title, transcript
+    )
     meta = {
-        "schema_version": 8,
+        "schema_version": 9,
         "prompt_fingerprint": PROMPT_FINGERPRINT,
+        "meeting_template_version": meeting_templates.TEMPLATE_VERSION,
+        "meeting_type": meeting_type,
         "model": OLLAMA_MODEL,
         "num_ctx": OLLAMA_NUM_CTX,
         "extract_think": SUMMARY_EXTRACT_THINK,
@@ -1292,7 +1303,9 @@ def summarize(session: str, transcript: str) -> str:
             if isinstance(cache.get("title"), str) and cache["title"].strip():
                 reusable["title"] = cache["title"]
         cache = {"_meta": meta, **reusable}
-    if cache.get("summary") and _valid_summary(cache["summary"]):
+    if cache.get("summary") and _valid_summary(
+        cache["summary"], meeting_type
+    ):
         ledger = cache.get("ledger")
         if isinstance(ledger, dict):
             quality = cache.get("quality")
@@ -1448,12 +1461,16 @@ def summarize(session: str, transcript: str) -> str:
         mode=0o600,
     )
 
-    meeting_title = _transcript_meeting_title(transcript)
     summary_title = str(cache.get("title", "")).strip() or meeting_title
     summary = _render_grounded_sections(
         SUMMARY_TEMPLATE, ledger, meeting_title=summary_title
     )
-    if not _valid_summary(summary):
+    template_section = meeting_templates.render_template_section(
+        meeting_type, ledger
+    )
+    if template_section:
+        summary = f"{summary.rstrip()}\n\n{template_section}"
+    if not _valid_summary(summary, meeting_type):
         raise ValueError("Summary не пройшла детерміновану перевірку структури")
     cache["summary"] = summary
     atomic_write_json(cache_path, cache, mode=0o600)

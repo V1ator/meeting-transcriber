@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import paths as project_paths
+from meeting_quality import assess_meet_capture
 
 from pipeline_utils import (
     atomic_write_json,
@@ -552,15 +553,20 @@ def import_export(path: Path, *, summarize: bool = True, force: bool = False) ->
 
     entries = normalized_entries(data)
     transcript = render_markdown(data, entries)
+    capture_quality = assess_meet_capture(data, entries)
     ensure_private_dir(project_paths.TRANSCRIPTS)
     work_dir = ensure_private_dir(project_paths.TRANSCRIPTS / session)
     atomic_write_json(work_dir / "meet-captions.json", data, mode=0o600)
+    atomic_write_json(
+        work_dir / "capture-quality.json", capture_quality, mode=0o600
+    )
     atomic_write_text(transcript_path, transcript, mode=0o600)
     atomic_write_json(work_dir / "manifest.json", {
         "schema_version": 1,
         "session": session,
         "completed_at": utc_now(),
         "source": "google-meet-live-captions",
+        "capture_quality": capture_quality,
         "quality": {
             "segments": len(entries),
             "speakers": sorted({entry["speaker"] for entry in entries}),

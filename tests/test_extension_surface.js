@@ -30,3 +30,13 @@ test("extension never captures or hides native Meet caption DOM", () => {
   assert.match(content, /CHAT_TEXT_SELECTOR/);
   assert.match(content, /PARTICIPANT_NAME_SELECTOR/);
 });
+
+test("widget supports persistent speaker aliases and RTC health export", () => {
+  const content = fs.readFileSync(path.join(extension, "content.js"), "utf8");
+  const model = fs.readFileSync(path.join(extension, "caption-model.js"), "utf8");
+  assert.match(content, /speakerAliases/);
+  assert.match(content, /speakerNameAliases/);
+  assert.match(content, /rename-speaker/);
+  assert.match(content, /refreshCaptureHealth/);
+  assert.match(model, /captureHealth/);
+});
