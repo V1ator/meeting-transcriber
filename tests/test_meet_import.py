@@ -9,7 +9,8 @@ from unittest import mock
 
 import meet_import
 import pipeline_utils
-import watch_and_process as watcher
+import audio_pipeline as audio
+import meet_pipeline as meet
 
 
 def sample_export() -> dict:
@@ -414,10 +415,9 @@ class MeetImportTests(unittest.TestCase):
             note = root / "notes" / "ready.md"
             with (
                 mock.patch.object(meet_import.project_paths, "TRANSCRIPTS", transcripts),
-                mock.patch.object(watcher.project_paths, "TRANSCRIPTS", transcripts),
-                mock.patch.object(watcher.project_paths, "RECORDINGS", recordings),
-                mock.patch.object(
-                    watcher, "create_note_from_transcript", return_value=note
+                mock.patch.object(meet.project_paths, "TRANSCRIPTS", transcripts),
+                mock.patch.object(meet.project_paths, "RECORDINGS", recordings),
+                mock.patch.object(audio, "create_note_from_transcript", return_value=note
                 ) as create_note,
             ):
                 result = meet_import.import_export(source)
@@ -439,11 +439,11 @@ class MeetImportTests(unittest.TestCase):
             os.utime(unrelated, (900, 900))
 
             with (
-                mock.patch.object(watcher, "MEET_AUTO_IMPORT", True),
-                mock.patch.object(watcher, "MEET_DOWNLOADS_DIR", downloads),
-                mock.patch.object(watcher, "MEET_IMPORT_STABLE_SECONDS", 5),
+                mock.patch.object(meet, "MEET_AUTO_IMPORT", True),
+                mock.patch.object(meet, "MEET_DOWNLOADS_DIR", downloads),
+                mock.patch.object(meet, "MEET_IMPORT_STABLE_SECONDS", 5),
             ):
-                ready = watcher.find_ready_meet_exports(now=1_000)
+                ready = meet.find_ready_meet_exports(now=1_000)
 
             self.assertEqual(ready, [stable])
 
@@ -469,22 +469,21 @@ class MeetImportTests(unittest.TestCase):
                 return note
 
             with (
-                mock.patch.object(watcher, "MEET_AUTO_IMPORT", True),
-                mock.patch.object(watcher, "MEET_AUTO_SUMMARY", True),
-                mock.patch.object(watcher, "MEET_IMPORT_EXISTING", True),
-                mock.patch.object(watcher, "MEET_DOWNLOADS_DIR", downloads),
-                mock.patch.object(watcher, "MEET_IMPORT_STABLE_SECONDS", 5),
-                mock.patch.object(watcher.project_paths, "TRANSCRIPTS", transcripts),
-                mock.patch.object(watcher.project_paths, "RECORDINGS", recordings),
-                mock.patch.object(watcher.project_paths, "NOTES", notes),
-                mock.patch.object(watcher.project_paths, "FAILED", root / "failed"),
+                mock.patch.object(meet, "MEET_AUTO_IMPORT", True),
+                mock.patch.object(meet, "MEET_AUTO_SUMMARY", True),
+                mock.patch.object(meet, "MEET_IMPORT_EXISTING", True),
+                mock.patch.object(meet, "MEET_DOWNLOADS_DIR", downloads),
+                mock.patch.object(meet, "MEET_IMPORT_STABLE_SECONDS", 5),
+                mock.patch.object(meet.project_paths, "TRANSCRIPTS", transcripts),
+                mock.patch.object(meet.project_paths, "RECORDINGS", recordings),
+                mock.patch.object(meet.project_paths, "NOTES", notes),
+                mock.patch.object(meet.project_paths, "FAILED", root / "failed"),
                 mock.patch.object(meet_import.project_paths, "TRANSCRIPTS", transcripts),
-                mock.patch.object(
-                    watcher, "create_note_from_transcript", side_effect=create_note
+                mock.patch.object(meet, "create_note_from_transcript", side_effect=create_note
                 ) as note_builder,
             ):
-                self.assertEqual(watcher.process_meet_exports(now=1_000), 1)
-                self.assertEqual(watcher.process_meet_exports(now=1_001), 0)
+                self.assertEqual(meet.process_meet_exports(now=1_000), 1)
+                self.assertEqual(meet.process_meet_exports(now=1_001), 0)
 
             note_builder.assert_called_once()
             self.assertFalse(source.exists())
@@ -525,22 +524,21 @@ class MeetImportTests(unittest.TestCase):
                 return expected_note
 
             with (
-                mock.patch.object(watcher, "MEET_AUTO_SUMMARY", True),
-                mock.patch.object(watcher.project_paths, "TRANSCRIPTS", transcripts),
-                mock.patch.object(watcher.project_paths, "RECORDINGS", recordings),
-                mock.patch.object(watcher.project_paths, "NOTES", notes),
-                mock.patch.object(watcher.project_paths, "FAILED", failed),
-                mock.patch.object(
-                    watcher, "create_note_from_transcript", side_effect=create_note
+                mock.patch.object(meet, "MEET_AUTO_SUMMARY", True),
+                mock.patch.object(meet.project_paths, "TRANSCRIPTS", transcripts),
+                mock.patch.object(meet.project_paths, "RECORDINGS", recordings),
+                mock.patch.object(meet.project_paths, "NOTES", notes),
+                mock.patch.object(meet.project_paths, "FAILED", failed),
+                mock.patch.object(meet, "create_note_from_transcript", side_effect=create_note
                 ) as note_builder,
             ):
                 self.assertEqual(
-                    watcher.find_ready_meet_sessions(now=1_000), [session]
+                    meet.find_ready_meet_sessions(now=1_000), [session]
                 )
                 self.assertEqual(
-                    watcher.process_failed_meet_sessions(now=1_000), 1
+                    meet.process_failed_meet_sessions(now=1_000), 1
                 )
-                self.assertEqual(watcher.find_ready_meet_sessions(now=1_001), [])
+                self.assertEqual(meet.find_ready_meet_sessions(now=1_001), [])
 
             note_builder.assert_called_once()
             self.assertTrue(expected_note.is_file())
@@ -571,14 +569,14 @@ class MeetImportTests(unittest.TestCase):
                 },
             )
             with (
-                mock.patch.object(watcher, "MEET_AUTO_SUMMARY", True),
-                mock.patch.object(watcher.project_paths, "TRANSCRIPTS", transcripts),
-                mock.patch.object(watcher.project_paths, "RECORDINGS", recordings),
-                mock.patch.object(watcher.project_paths, "NOTES", notes),
+                mock.patch.object(meet, "MEET_AUTO_SUMMARY", True),
+                mock.patch.object(meet.project_paths, "TRANSCRIPTS", transcripts),
+                mock.patch.object(meet.project_paths, "RECORDINGS", recordings),
+                mock.patch.object(meet.project_paths, "NOTES", notes),
             ):
-                self.assertEqual(watcher.find_ready_meet_sessions(now=1_000), [])
+                self.assertEqual(meet.find_ready_meet_sessions(now=1_000), [])
                 self.assertEqual(
-                    watcher.find_ready_meet_sessions(now=1_100), [session]
+                    meet.find_ready_meet_sessions(now=1_100), [session]
                 )
 
     def test_watcher_skips_existing_backlog_then_imports_new_download(self):
@@ -592,19 +590,19 @@ class MeetImportTests(unittest.TestCase):
             os.utime(source, (900, 900))
 
             with (
-                mock.patch.object(watcher, "MEET_AUTO_IMPORT", True),
-                mock.patch.object(watcher, "MEET_AUTO_SUMMARY", False),
-                mock.patch.object(watcher, "MEET_IMPORT_EXISTING", False),
-                mock.patch.object(watcher, "MEET_DOWNLOADS_DIR", downloads),
-                mock.patch.object(watcher, "MEET_IMPORT_STABLE_SECONDS", 5),
-                mock.patch.object(watcher.project_paths, "TRANSCRIPTS", transcripts),
+                mock.patch.object(meet, "MEET_AUTO_IMPORT", True),
+                mock.patch.object(meet, "MEET_AUTO_SUMMARY", False),
+                mock.patch.object(meet, "MEET_IMPORT_EXISTING", False),
+                mock.patch.object(meet, "MEET_DOWNLOADS_DIR", downloads),
+                mock.patch.object(meet, "MEET_IMPORT_STABLE_SECONDS", 5),
+                mock.patch.object(meet.project_paths, "TRANSCRIPTS", transcripts),
                 mock.patch.object(meet_import.project_paths, "TRANSCRIPTS", transcripts),
             ):
-                self.assertEqual(watcher.process_meet_exports(now=1_000), 0)
+                self.assertEqual(meet.process_meet_exports(now=1_000), 0)
                 self.assertFalse(list(transcripts.glob("*_meet-*.md")))
 
                 os.utime(source, (1_001, 1_001))
-                self.assertEqual(watcher.process_meet_exports(now=1_010), 1)
+                self.assertEqual(meet.process_meet_exports(now=1_010), 1)
 
             self.assertFalse(source.exists())
             self.assertEqual(len(list(transcripts.glob("*_meet-*.md"))), 1)
@@ -622,23 +620,21 @@ class MeetImportTests(unittest.TestCase):
             os.utime(source, (900, 900))
 
             with (
-                mock.patch.object(watcher, "MEET_AUTO_IMPORT", True),
-                mock.patch.object(watcher, "MEET_AUTO_SUMMARY", True),
-                mock.patch.object(watcher, "MEET_IMPORT_EXISTING", True),
-                mock.patch.object(watcher, "MEET_DOWNLOADS_DIR", downloads),
-                mock.patch.object(watcher, "MEET_IMPORT_STABLE_SECONDS", 5),
-                mock.patch.object(watcher.project_paths, "TRANSCRIPTS", transcripts),
-                mock.patch.object(watcher.project_paths, "RECORDINGS", recordings),
-                mock.patch.object(watcher.project_paths, "NOTES", notes),
-                mock.patch.object(watcher.project_paths, "FAILED", root / "failed"),
+                mock.patch.object(meet, "MEET_AUTO_IMPORT", True),
+                mock.patch.object(meet, "MEET_AUTO_SUMMARY", True),
+                mock.patch.object(meet, "MEET_IMPORT_EXISTING", True),
+                mock.patch.object(meet, "MEET_DOWNLOADS_DIR", downloads),
+                mock.patch.object(meet, "MEET_IMPORT_STABLE_SECONDS", 5),
+                mock.patch.object(meet.project_paths, "TRANSCRIPTS", transcripts),
+                mock.patch.object(meet.project_paths, "RECORDINGS", recordings),
+                mock.patch.object(meet.project_paths, "NOTES", notes),
+                mock.patch.object(meet.project_paths, "FAILED", root / "failed"),
                 mock.patch.object(meet_import.project_paths, "TRANSCRIPTS", transcripts),
-                mock.patch.object(
-                    watcher,
-                    "create_note_from_transcript",
+                mock.patch.object(meet, "create_note_from_transcript",
                     side_effect=RuntimeError("summary failed"),
                 ),
             ):
-                self.assertEqual(watcher.process_meet_exports(now=1_000), 0)
+                self.assertEqual(meet.process_meet_exports(now=1_000), 0)
 
             self.assertTrue(source.exists())
             self.assertEqual(len(list(transcripts.glob("*_meet-*.md"))), 1)
@@ -662,24 +658,23 @@ class MeetImportTests(unittest.TestCase):
                 return note
 
             patches = (
-                mock.patch.object(watcher, "MEET_AUTO_IMPORT", True),
-                mock.patch.object(watcher, "MEET_AUTO_SUMMARY", True),
-                mock.patch.object(watcher, "MEET_IMPORT_EXISTING", True),
-                mock.patch.object(watcher, "MEET_DOWNLOADS_DIR", downloads),
-                mock.patch.object(watcher, "MEET_IMPORT_STABLE_SECONDS", 5),
-                mock.patch.object(watcher.project_paths, "TRANSCRIPTS", transcripts),
-                mock.patch.object(watcher.project_paths, "RECORDINGS", recordings),
-                mock.patch.object(watcher.project_paths, "NOTES", notes),
-                mock.patch.object(watcher.project_paths, "FAILED", root / "failed"),
+                mock.patch.object(meet, "MEET_AUTO_IMPORT", True),
+                mock.patch.object(meet, "MEET_AUTO_SUMMARY", True),
+                mock.patch.object(meet, "MEET_IMPORT_EXISTING", True),
+                mock.patch.object(meet, "MEET_DOWNLOADS_DIR", downloads),
+                mock.patch.object(meet, "MEET_IMPORT_STABLE_SECONDS", 5),
+                mock.patch.object(meet.project_paths, "TRANSCRIPTS", transcripts),
+                mock.patch.object(meet.project_paths, "RECORDINGS", recordings),
+                mock.patch.object(meet.project_paths, "NOTES", notes),
+                mock.patch.object(meet.project_paths, "FAILED", root / "failed"),
                 mock.patch.object(meet_import.project_paths, "TRANSCRIPTS", transcripts),
-                mock.patch.object(
-                    watcher, "create_note_from_transcript", side_effect=create_note
+                mock.patch.object(meet, "create_note_from_transcript", side_effect=create_note
                 ),
             )
             with patches[0], patches[1], patches[2], patches[3], patches[4], \
                     patches[5], patches[6], patches[7], patches[8], patches[9], \
                     patches[10]:
-                self.assertEqual(watcher.process_meet_exports(now=1_000), 1)
+                self.assertEqual(meet.process_meet_exports(now=1_000), 1)
                 fuller = sample_export()
                 fuller["entries"].append({
                     "speaker": "Анна",
@@ -689,7 +684,7 @@ class MeetImportTests(unittest.TestCase):
                 })
                 source.write_text(json.dumps(fuller), encoding="utf-8")
                 os.utime(source, (1_001, 1_001))
-                self.assertEqual(watcher.process_meet_exports(now=1_010), 1)
+                self.assertEqual(meet.process_meet_exports(now=1_010), 1)
 
             transcript = (transcripts / f"{session}.md").read_text(encoding="utf-8")
             self.assertIn("Новий повніший хвіст зустрічі", transcript)
@@ -716,17 +711,17 @@ class MeetImportTests(unittest.TestCase):
                 recordings / f"{session}.json",
                 {"status": "terminal_failed", "processing_attempts": 8},
             )
-            with mock.patch.object(watcher, "MEET_AUTO_IMPORT", True), \
-                    mock.patch.object(watcher, "MEET_AUTO_SUMMARY", True), \
-                    mock.patch.object(watcher, "MEET_IMPORT_EXISTING", True), \
-                    mock.patch.object(watcher, "MEET_DOWNLOADS_DIR", downloads), \
-                    mock.patch.object(watcher, "MEET_IMPORT_STABLE_SECONDS", 5), \
-                    mock.patch.object(watcher.project_paths, "TRANSCRIPTS", transcripts), \
-                    mock.patch.object(watcher.project_paths, "RECORDINGS", recordings), \
-                    mock.patch.object(watcher.project_paths, "NOTES", notes), \
-                    mock.patch.object(watcher.project_paths, "FAILED", failed), \
+            with mock.patch.object(meet, "MEET_AUTO_IMPORT", True), \
+                    mock.patch.object(meet, "MEET_AUTO_SUMMARY", True), \
+                    mock.patch.object(meet, "MEET_IMPORT_EXISTING", True), \
+                    mock.patch.object(meet, "MEET_DOWNLOADS_DIR", downloads), \
+                    mock.patch.object(meet, "MEET_IMPORT_STABLE_SECONDS", 5), \
+                    mock.patch.object(meet.project_paths, "TRANSCRIPTS", transcripts), \
+                    mock.patch.object(meet.project_paths, "RECORDINGS", recordings), \
+                    mock.patch.object(meet.project_paths, "NOTES", notes), \
+                    mock.patch.object(meet.project_paths, "FAILED", failed), \
                     mock.patch.object(meet_import.project_paths, "TRANSCRIPTS", transcripts):
-                self.assertEqual(watcher.process_meet_exports(now=1_000), 0)
+                self.assertEqual(meet.process_meet_exports(now=1_000), 0)
             self.assertFalse(source.exists())
             self.assertEqual(len(list(failed.glob("meet-*.json"))), 1)
 
@@ -740,14 +735,14 @@ class MeetImportTests(unittest.TestCase):
             source = downloads / "meet-crafted-export.json"
             source.write_text('{"schemaVersion": 1, "entries": []}', encoding="utf-8")
             os.utime(source, (900, 900))
-            with mock.patch.object(watcher, "MEET_AUTO_IMPORT", True), \
-                    mock.patch.object(watcher, "MEET_IMPORT_EXISTING", True), \
-                    mock.patch.object(watcher, "MEET_DOWNLOADS_DIR", downloads), \
-                    mock.patch.object(watcher, "MEET_IMPORT_STABLE_SECONDS", 5), \
-                    mock.patch.object(watcher.project_paths, "TRANSCRIPTS", transcripts), \
-                    mock.patch.object(watcher.project_paths, "FAILED", failed), \
+            with mock.patch.object(meet, "MEET_AUTO_IMPORT", True), \
+                    mock.patch.object(meet, "MEET_IMPORT_EXISTING", True), \
+                    mock.patch.object(meet, "MEET_DOWNLOADS_DIR", downloads), \
+                    mock.patch.object(meet, "MEET_IMPORT_STABLE_SECONDS", 5), \
+                    mock.patch.object(meet.project_paths, "TRANSCRIPTS", transcripts), \
+                    mock.patch.object(meet.project_paths, "FAILED", failed), \
                     mock.patch.object(meet_import.project_paths, "TRANSCRIPTS", transcripts):
-                self.assertEqual(watcher.process_meet_exports(now=1_000), 0)
+                self.assertEqual(meet.process_meet_exports(now=1_000), 0)
             self.assertFalse(source.exists())
             self.assertTrue((failed / source.name).is_file())
 

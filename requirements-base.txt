@@ -1,0 +1,2 @@
+# Meet import, summary, candidate та Notion flows використовують Python stdlib.
+# Файл лишається явною точкою для майбутніх базових залежностей.

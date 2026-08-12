@@ -4,7 +4,7 @@ const assert = require("node:assert/strict");
 const test = require("node:test");
 const Fallback = require("../chrome-extension/rtc-fallback.js");
 
-test("open RTC channel without speech does not activate DOM fallback", () => {
+test("open RTC channel without speech does not activate recovery", () => {
   const deadline = Fallback.arm(0, 1_000, 20_000, 0, "open");
   assert.equal(deadline, 0);
   assert.equal(Fallback.isDue(21_000, 21_000, 0, "open"), false);
@@ -22,25 +22,9 @@ test("first decoded caption disarms startup fallback", () => {
   assert.equal(Fallback.isDue(deadline, 30_000, 1, "open"), false);
 });
 
-test("RTC connection timeout activates recovery when channel never opens", () => {
+test("RTC connection timeout is due when channel never opens", () => {
   const deadline = Fallback.arm(0, 1_000, 20_000, 0, "connecting");
   assert.equal(deadline, 21_000);
   assert.equal(Fallback.isDue(deadline, 20_999, 0, "connecting"), false);
   assert.equal(Fallback.isDue(deadline, 21_000, 0, "connecting"), true);
-});
-
-test("recovery defaults to audio without activating DOM captions", () => {
-  assert.deepEqual(Fallback.recovery(false), {
-    rtcUnavailable: true,
-    domFallbackActive: false,
-    backup: "audio",
-  });
-});
-
-test("DOM recovery remains available only as an explicit diagnostic mode", () => {
-  assert.deepEqual(Fallback.recovery(true), {
-    rtcUnavailable: true,
-    domFallbackActive: true,
-    backup: "dom",
-  });
 });

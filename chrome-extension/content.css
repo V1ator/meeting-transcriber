@@ -1,39 +1,5 @@
-#meeting-transcriber-widget,
-.meeting-transcriber-hide-native-captions
-  [data-meeting-transcriber-caption-region],
-.meeting-transcriber-hide-native-captions
-  [data-meeting-transcriber-caption-host],
-.meeting-transcriber-hide-native-captions
-  [data-meeting-transcriber-caption-shell],
-.meeting-transcriber-hide-native-captions
-  [role="region"].vNKgIf.UDinHf {
+#meeting-transcriber-widget {
   transition: opacity 120ms ease;
-}
-
-.meeting-transcriber-hide-native-captions
-  [data-meeting-transcriber-caption-region],
-.meeting-transcriber-hide-native-captions
-  [data-meeting-transcriber-caption-host],
-.meeting-transcriber-hide-native-captions
-  [data-meeting-transcriber-caption-shell],
-.meeting-transcriber-hide-native-captions
-  [role="region"].vNKgIf.UDinHf {
-  opacity: 0 !important;
-  visibility: hidden !important;
-  background: transparent !important;
-  box-shadow: none !important;
-  pointer-events: none !important;
-}
-
-.meeting-transcriber-hide-native-captions
-  [data-meeting-transcriber-caption-shell] {
-  min-height: 0 !important;
-  height: 0 !important;
-  max-height: 0 !important;
-  margin-block: 0 !important;
-  padding-block: 0 !important;
-  border: 0 !important;
-  overflow: hidden !important;
 }
 
 #meeting-transcriber-widget {
@@ -88,7 +54,6 @@
   background: #f2b84b;
 }
 
-#meeting-transcriber-widget[data-status="capturing"] header i,
 #meeting-transcriber-widget[data-status="capturing-rtc"] header i {
   background: #42cf83;
   box-shadow: 0 0 0 4px rgba(66, 207, 131, 0.13);

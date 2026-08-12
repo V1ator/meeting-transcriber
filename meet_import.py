@@ -17,6 +17,7 @@ from pipeline_utils import (
     atomic_write_json,
     atomic_write_text,
     ensure_private_dir,
+    update_manifest,
     utc_now,
 )
 
@@ -52,12 +53,11 @@ def _check_deadline(deadline: float | None) -> None:
         raise MeetImportError("Нормалізація Meet export перевищила ліміт часу")
 
 
-def _watcher_module():
-    # Lazy import keeps this module reusable from watch_and_process.py without
-    # creating a circular import during watcher startup.
-    import watch_and_process
+def _session_pipeline_module():
+    # Lazy import keeps normalization reusable without loading audio processing.
+    import audio_pipeline
 
-    return watch_and_process
+    return audio_pipeline
 
 
 def _clean_inline(value: Any, *, fallback: str = "") -> str:
@@ -572,9 +572,9 @@ def import_export(path: Path, *, summarize: bool = True, force: bool = False) ->
     if not summarize:
         return transcript_path
 
-    watcher = _watcher_module()
+    session_pipeline = _session_pipeline_module()
     ensure_private_dir(project_paths.RECORDINGS)
-    atomic_write_json(watcher.manifest_path(session), {
+    atomic_write_json(session_pipeline.manifest_path(session), {
         "schema_version": 1,
         "session": session,
         "status": "processing",
@@ -582,9 +582,9 @@ def import_export(path: Path, *, summarize: bool = True, force: bool = False) ->
         "source": "google-meet-live-captions",
         "created_at": utc_now(),
     }, mode=0o600)
-    note = watcher.create_note_from_transcript(session, transcript)
-    watcher.update_manifest(
-        watcher.manifest_path(session),
+    note = session_pipeline.create_note_from_transcript(session, transcript)
+    update_manifest(
+        session_pipeline.manifest_path(session),
         status="complete",
         stage="complete",
         note=str(note),

@@ -2,30 +2,16 @@
   "use strict";
 
   const Model = globalThis.MeetingCaptionModel;
-  const CaptionToggle = globalThis.MeetingCaptionToggle;
   const AutoExport = globalThis.MeetingAutoExport;
   const RtcFallback = globalThis.MeetingRtcFallback;
   const STORAGE_PREFIX = "meeting-transcriber:";
   const SETTINGS_KEY = "meeting-transcriber:settings";
-  const HIDE_NATIVE_CLASS = "meeting-transcriber-hide-native-captions";
   const FINALIZE_DELAY_MS = 1800;
-  const AUTO_ENABLE_RETRY_MS = 8_000;
-  const AUTO_ENABLE_MAX_ATTEMPTS = 3;
   const RTC_FALLBACK_DELAY_MS = 20_000;
   const RTC_EVENT_NAME = "meeting-transcriber:rtc";
   const RTC_COMMAND_NAME = "meeting-transcriber:rtc-command";
   const RTC_SESSION_NONCE = globalThis.crypto.randomUUID();
   const WIDGET_EDGE_MARGIN = 8;
-  const KNOWN_REGION_SELECTOR = '[role="region"].vNKgIf.UDinHf';
-  const CAPTION_HOST_MARKER = "data-meeting-transcriber-caption-host";
-  const CAPTION_SHELL_MARKER = "data-meeting-transcriber-caption-shell";
-  const STAGE_MARKER = "data-meeting-transcriber-expanded-stage";
-  const STAGE_FILL_MARKER = "data-meeting-transcriber-stage-fill";
-  const STAGE_VIDEO_MARKER = "data-meeting-transcriber-stage-video";
-  const STAGE_TILE_MARKER = "data-meeting-transcriber-stage-tile";
-  const ENTRY_SELECTOR = ".nMcdL";
-  const SPEAKER_SELECTOR = ".NWpY1d";
-  const TEXT_SELECTOR = ".ygicle";
   const CHAT_TEXT_SELECTOR =
     ".oIy2qc, [data-meeting-transcriber-chat-text]";
   const CHAT_SPEAKER_SELECTOR =
@@ -43,20 +29,11 @@
   let meetingCode = "";
   let state = null;
   let paused = false;
-  let observer = null;
-  let observedRegion = null;
-  let scanTimer = null;
   let saveTimer = null;
   let settingsSaveTimer = null;
   let startedEpoch = Date.now();
-  let nodeSerial = 1;
-  let autoEnableCaptions = true;
-  let hideNativeCaptions = true;
   let autoExportEnabled = true;
   let captureChat = true;
-  let rtcCaptureEnabled = true;
-  let domFallbackEnabled = false;
-  let rtcFallbackActive = false;
   let rtcUnavailable = false;
   let rtcFallbackTimer = null;
   let rtcFallbackDeadline = 0;
@@ -74,24 +51,14 @@
   };
   let widgetPosition = null;
   let lastExportSignature = "";
-  let autoEnableAttempts = 0;
-  let autoEnablePendingUntil = 0;
-  let captionsWereEnabled = false;
   let lastCaptionActivityEpoch = 0;
-  let lastCaptionFingerprint = "";
   let compactedState = null;
   let compactedRevision = -1;
   let compactedEntries = [];
-  const nodeKeys = new WeakMap();
-  const liveKeys = new Set();
   const finalizeTimers = new Map();
   const chatSeenKeys = new Set();
   const memoryStorage = {};
   const rtcSpeakerNames = new Map();
-
-  // RTC is the default path. Never inherit native-caption hiding from a
-  // previous content-script instance unless diagnostic DOM capture is active.
-  document.documentElement.classList.remove(HIDE_NATIVE_CLASS);
 
   function currentMeetingCode() {
     const match = location.pathname.match(/^\/([a-z]{3}-[a-z]{4}-[a-z]{3})(?:\/|$)/i);
@@ -192,28 +159,19 @@
       const parsed = Date.parse(state.startedAt);
       if (Number.isFinite(parsed)) startedEpoch = parsed;
     }
-    autoEnableCaptions = stored[SETTINGS_KEY]?.autoEnableCaptions !== false;
-    hideNativeCaptions = stored[SETTINGS_KEY]?.hideNativeCaptions !== false;
     autoExportEnabled = stored[SETTINGS_KEY]?.autoExportEnabled !== false;
     captureChat = stored[SETTINGS_KEY]?.captureChat !== false;
-    rtcCaptureEnabled = stored[SETTINGS_KEY]?.rtcCaptureEnabled !== false;
-    domFallbackEnabled = stored[SETTINGS_KEY]?.domFallbackEnabled === true;
     const savedPosition = stored[SETTINGS_KEY]?.widgetPosition;
     if (Number.isFinite(savedPosition?.x) && Number.isFinite(savedPosition?.y)) {
       widgetPosition = { x: savedPosition.x, y: savedPosition.y };
     }
-    applyNativeCaptionVisibility();
   }
 
   async function saveSettings() {
     await storageSet({
       [SETTINGS_KEY]: {
-        autoEnableCaptions,
-        hideNativeCaptions,
         autoExportEnabled,
         captureChat,
-        rtcCaptureEnabled,
-        domFallbackEnabled,
         widgetPosition,
       },
     });
@@ -235,11 +193,6 @@
     }, 250);
   }
 
-  function keyForNode(node) {
-    if (!nodeKeys.has(node)) nodeKeys.set(node, `caption-${nodeSerial++}`);
-    return nodeKeys.get(node);
-  }
-
   function scheduleFinalize(key) {
     clearTimeout(finalizeTimers.get(key));
     finalizeTimers.set(key, setTimeout(() => {
@@ -248,24 +201,6 @@
       scheduleSave();
       render();
     }, FINALIZE_DELAY_MS));
-  }
-
-  function processEntry(entry, replayScan = false) {
-    const textNode = entry.querySelector(TEXT_SELECTOR);
-    if (!textNode) return null;
-    if (!state.startedAt) startedEpoch = Date.now();
-    const key = keyForNode(entry);
-    const item = Model.observe(state, {
-      key,
-      speaker: entry.querySelector(SPEAKER_SELECTOR)?.textContent,
-      text: textNode.textContent,
-      replayScan,
-      atMs: elapsedMs(),
-      observedAt: new Date().toISOString(),
-    });
-    if (!item) return null;
-    scheduleFinalize(key);
-    return key;
   }
 
   function rtcCommand(type) {
@@ -337,7 +272,7 @@
   }
 
   function processRtcCaption(message) {
-    if (!rtcCaptureEnabled || paused || !state) return;
+    if (paused || !state) return;
     const text = Model.normalizeText(message?.text);
     const deviceId = normalizeRtcDeviceId(message?.deviceId);
     const messageId = String(message?.messageId || "");
@@ -346,12 +281,10 @@
         || text.length > 20_000 || deviceId.length > 500 || messageId.length > 500
         || !Number.isSafeInteger(messageVersion) || messageVersion < 0) return;
     if (!state.startedAt) startedEpoch = Date.now();
-    rtcFallbackActive = false;
     rtcUnavailable = false;
     rtcFallbackDeadline = 0;
     rtcFallbackRequiresReconnect = false;
     clearTimeout(rtcFallbackTimer);
-    applyNativeCaptionVisibility();
     lastCaptionActivityEpoch = Date.now();
     const key = `rtc-${messageId}`;
     const item = Model.observeVersioned(state, {
@@ -370,7 +303,6 @@
 
   function scheduleRtcFallback() {
     clearTimeout(rtcFallbackTimer);
-    if (!rtcCaptureEnabled) return;
     const now = Date.now();
     const effectiveDecoded = rtcFallbackRequiresReconnect
       ? 0
@@ -393,11 +325,7 @@
         scheduleRtcFallback();
         return;
       }
-      const recovery = RtcFallback.recovery(domFallbackEnabled);
-      rtcUnavailable = recovery.rtcUnavailable;
-      rtcFallbackActive = recovery.domFallbackActive;
-      applyNativeCaptionVisibility();
-      if (rtcFallbackActive) maybeEnableCaptions();
+      rtcUnavailable = true;
       render();
     }, Math.max(0, rtcFallbackDeadline - now));
   }
@@ -407,7 +335,7 @@
     if (detail.nonce !== RTC_SESSION_NONCE) return;
     if (detail.type === "ready") {
       rtcStatus.ready = true;
-      if (rtcCaptureEnabled) rtcCommand("start");
+      rtcCommand("start");
       render();
       return;
     }
@@ -436,187 +364,19 @@
       detail.reason === "unsupported"
       || (detail.failures >= 3 && detail.decoded === 0)
     ) {
-      const recovery = RtcFallback.recovery(domFallbackEnabled);
-      rtcUnavailable = recovery.rtcUnavailable;
-      rtcFallbackActive = recovery.domFallbackActive;
+      rtcUnavailable = true;
       rtcFallbackDeadline = 0;
       clearTimeout(rtcFallbackTimer);
-      applyNativeCaptionVisibility();
-      if (rtcFallbackActive) maybeEnableCaptions();
     } else if (["closed", "channel-error"].includes(detail.reason)) {
       rtcFallbackRequiresReconnect = true;
       rtcCommand("retry");
       scheduleRtcFallback();
     } else if (detail.channelState === "open") {
-      rtcFallbackActive = false;
       rtcUnavailable = false;
       rtcFallbackDeadline = 0;
       rtcFallbackRequiresReconnect = false;
       clearTimeout(rtcFallbackTimer);
-      applyNativeCaptionVisibility();
     }
-    render();
-  }
-
-  function findCaptionRegion() {
-    const known = document.querySelector(KNOWN_REGION_SELECTOR);
-    const semantic = Array.from(document.querySelectorAll(
-      '[role="region"], [aria-live="polite"], [aria-live="assertive"]'
-    )).find((candidate) => {
-      const label = [
-        candidate.getAttribute("aria-label"),
-        candidate.getAttribute("data-tooltip"),
-        candidate.getAttribute("title"),
-      ].filter(Boolean).join(" ");
-      return CaptionToggle.isCaptionLabel(label);
-    });
-    const region = known || semantic || Array.from(
-      document.querySelectorAll('[role="region"]')
-    ).find((candidate) => candidate.querySelector(ENTRY_SELECTOR)) || null;
-    if (region) {
-      region.setAttribute("data-meeting-transcriber-caption-region", "");
-      region.setAttribute(
-        "aria-hidden",
-        rtcFallbackActive && hideNativeCaptions ? "true" : "false"
-      );
-      markCaptionSurface(region);
-    }
-    return region;
-  }
-
-  function markCaptionSurface(region) {
-    const preferredHost = region.closest('[jsname="tgaKEf"]');
-    const surface = preferredHost && ![document.body, document.documentElement].includes(
-      preferredHost
-    ) ? preferredHost : region;
-    document.querySelectorAll(`[${CAPTION_HOST_MARKER}]`).forEach((element) => {
-      if (element !== surface) element.removeAttribute(CAPTION_HOST_MARKER);
-    });
-    surface.setAttribute(CAPTION_HOST_MARKER, "");
-
-    const shells = new Set();
-    let candidate = surface.parentElement;
-    for (let depth = 0; candidate && depth < 3; depth += 1) {
-      if ([document.body, document.documentElement].includes(candidate)) break;
-      if (candidate.matches("main, [role=main], [role=toolbar]")) break;
-      if (candidate.querySelector("video, canvas, [data-participant-id]")) break;
-      const unrelatedControl = Array.from(candidate.querySelectorAll(
-        "button, [role=button]"
-      )).some((control) => {
-        const label = [
-          control.getAttribute("aria-label"),
-          control.getAttribute("data-tooltip"),
-          control.getAttribute("title"),
-          control.textContent,
-        ].filter(Boolean).join(" ");
-        return !CaptionToggle.isCaptionLabel(label);
-      });
-      if (unrelatedControl) break;
-      const bounds = candidate.getBoundingClientRect();
-      if (bounds.height > 360 || bounds.height > window.innerHeight * 0.45) break;
-      shells.add(candidate);
-      candidate = candidate.parentElement;
-    }
-    document.querySelectorAll(`[${CAPTION_SHELL_MARKER}]`).forEach((element) => {
-      if (!shells.has(element)) element.removeAttribute(CAPTION_SHELL_MARKER);
-    });
-    shells.forEach((element) => element.setAttribute(CAPTION_SHELL_MARKER, ""));
-  }
-
-  function clearLegacyMeetingLayoutOverrides() {
-    // Стабільний режим не змінює геометрію Meet. Очищення потрібне після
-    // reload із версій, які ставили layout-маркери та inline CSS.
-    document.querySelectorAll(`[${STAGE_MARKER}]`).forEach((stage) => {
-      stage.removeAttribute(STAGE_MARKER);
-      stage.style.removeProperty("--meeting-transcriber-stage-bottom");
-    });
-    document.querySelectorAll(
-      `[${STAGE_FILL_MARKER}], [${STAGE_VIDEO_MARKER}], [${STAGE_TILE_MARKER}]`
-    ).forEach((element) => {
-      element.removeAttribute(STAGE_FILL_MARKER);
-      element.removeAttribute(STAGE_VIDEO_MARKER);
-      element.removeAttribute(STAGE_TILE_MARKER);
-      element.style.removeProperty("--meeting-transcriber-tile-left");
-      element.style.removeProperty("--meeting-transcriber-tile-top");
-      element.style.removeProperty("--meeting-transcriber-tile-width");
-      element.style.removeProperty("--meeting-transcriber-tile-height");
-    });
-  }
-
-  function applyNativeCaptionVisibility() {
-    const hideCaptions = domFallbackEnabled
-      && rtcFallbackActive
-      && hideNativeCaptions;
-    document.documentElement.classList.toggle(
-      HIDE_NATIVE_CLASS, hideCaptions
-    );
-    if (!domFallbackEnabled || !rtcFallbackActive) {
-      document.querySelectorAll(
-        `[data-meeting-transcriber-caption-region], `
-        + `[${CAPTION_HOST_MARKER}], [${CAPTION_SHELL_MARKER}]`
-      ).forEach((element) => {
-        element.setAttribute("aria-hidden", "false");
-        element.removeAttribute("data-meeting-transcriber-caption-region");
-        element.removeAttribute(CAPTION_HOST_MARKER);
-        element.removeAttribute(CAPTION_SHELL_MARKER);
-      });
-      clearLegacyMeetingLayoutOverrides();
-      return;
-    }
-    const region = findCaptionRegion();
-    if (region) {
-      region.setAttribute("aria-hidden", hideCaptions ? "true" : "false");
-    }
-    clearLegacyMeetingLayoutOverrides();
-  }
-
-  function scan() {
-    if (paused || !state) return;
-    if (!rtcFallbackActive) {
-      setStatus(
-        rtcUnavailable || !rtcCaptureEnabled
-          ? "rtc-unavailable"
-          : rtcStatus.channelState === "open" || rtcStatus.decoded > 0
-          ? "capturing-rtc"
-          : "connecting"
-      );
-      return;
-    }
-    const region = findCaptionRegion();
-    if (!region) {
-      setStatus("waiting");
-      return;
-    }
-    setStatus("capturing");
-    const current = new Set();
-    const entries = Array.from(region.querySelectorAll(ENTRY_SELECTOR));
-    const fingerprint = entries.map((entry) => [
-      entry.querySelector(SPEAKER_SELECTOR)?.textContent || "",
-      entry.querySelector(TEXT_SELECTOR)?.textContent || "",
-    ].join("\u0000")).join("\u0001");
-    if (fingerprint && fingerprint !== lastCaptionFingerprint) {
-      lastCaptionFingerprint = fingerprint;
-      lastCaptionActivityEpoch = Date.now();
-    }
-    const replayScan = entries.some((entry) => Model.isHistoricalReplay(
-      state,
-      entry.querySelector(SPEAKER_SELECTOR)?.textContent,
-      entry.querySelector(TEXT_SELECTOR)?.textContent
-    ));
-    entries.forEach((entry) => {
-      const key = processEntry(entry, replayScan);
-      if (key) current.add(key);
-    });
-    liveKeys.forEach((key) => {
-      if (!current.has(key)) {
-        clearTimeout(finalizeTimers.get(key));
-        finalizeTimers.delete(key);
-        Model.finalize(state, key, elapsedMs());
-      }
-    });
-    liveKeys.clear();
-    current.forEach((key) => liveKeys.add(key));
-    scheduleSave();
     render();
   }
 
@@ -689,47 +449,6 @@
     if (changed) scheduleSave();
   }
 
-  function connectObserver() {
-    if (!domFallbackEnabled || !rtcFallbackActive) {
-      if (observer) observer.disconnect();
-      observer = null;
-      observedRegion = null;
-      return;
-    }
-    const region = findCaptionRegion();
-    if (region === observedRegion) return;
-    if (observer) observer.disconnect();
-    observedRegion = region;
-    if (!region) return;
-    observer = new MutationObserver(() => {
-      clearTimeout(scanTimer);
-      scanTimer = setTimeout(scan, 80);
-    });
-    observer.observe(region, { childList: true, subtree: true, characterData: true });
-    scan();
-  }
-
-  function maybeEnableCaptions() {
-    if (!domFallbackEnabled || !rtcFallbackActive) return;
-    const region = findCaptionRegion();
-    if (region) {
-      captionsWereEnabled = true;
-      autoEnablePendingUntil = 0;
-      return;
-    }
-    if (!autoEnableCaptions || captionsWereEnabled
-        || autoEnableAttempts >= AUTO_ENABLE_MAX_ATTEMPTS) {
-      return;
-    }
-    if (Date.now() < autoEnablePendingUntil) return;
-    const button = CaptionToggle.findEnableButton(document);
-    if (!button) return;
-    autoEnableAttempts += 1;
-    autoEnablePendingUntil = Date.now() + AUTO_ENABLE_RETRY_MS;
-    setStatus("enabling");
-    button.click();
-  }
-
   function download(filename, content, type) {
     const url = URL.createObjectURL(new Blob([content], { type }));
     const link = document.createElement("a");
@@ -765,13 +484,14 @@
   }
 
   function exportJson() {
+    scanChat();
     scanParticipants();
     downloadJsonExport(Model.exportState(state));
   }
 
   function autoExportJson() {
     if (!autoExportEnabled || !state) return false;
-    scan();
+    scanChat();
     scanParticipants();
     const exported = Model.exportState(state);
     if (!exported.entries.length) return false;
@@ -782,56 +502,6 @@
     storageSet({ [storageKey()]: state }).catch(() => {});
     downloadJsonExport(exported);
     return true;
-  }
-
-  function formatOffset(milliseconds) {
-    const total = Math.floor(milliseconds / 1000);
-    const hours = String(Math.floor(total / 3600)).padStart(2, "0");
-    const minutes = String(Math.floor((total % 3600) / 60)).padStart(2, "0");
-    const seconds = String(total % 60).padStart(2, "0");
-    return `${hours}:${minutes}:${seconds}`;
-  }
-
-  function formatMeetingTime(value) {
-    const parsed = new Date(value);
-    if (!Number.isFinite(parsed.getTime())) return String(value || "");
-    return new Intl.DateTimeFormat("uk-UA", {
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit",
-      hour: "2-digit",
-      minute: "2-digit",
-      second: "2-digit",
-      timeZoneName: "short",
-    }).format(parsed);
-  }
-
-  function exportMarkdown() {
-    scanParticipants();
-    const exported = Model.exportState(state);
-    const title = exported.meetingTitle || "Google Meet";
-    const participants = exported.participants?.length
-      ? exported.participants
-      : ["Не визначено"];
-    const lines = [
-      `# ${title}`,
-      "",
-      `- **Час початку:** ${formatMeetingTime(exported.startedAt)}`,
-      `- **Назва зустрічі:** ${title}`,
-      "",
-      "**Учасники:**",
-      ...participants.map((participant) => `- ${participant}`),
-      "",
-      "## Транскрипт",
-      "",
-    ];
-    exported.entries.forEach((entry) => {
-      const speaker = entry.kind === "chat"
-        ? `${entry.speaker} (chat)`
-        : entry.speaker;
-      lines.push(`[${formatOffset(entry.startMs)}] ${speaker}: ${entry.text}`);
-    });
-    download(`meet-${meetingCode}.md`, `${lines.join("\n")}\n`, "text/markdown");
   }
 
   function widget() {
@@ -980,8 +650,7 @@
       preview.append(row);
     });
     const rtcWarning = root.querySelector("[data-role=rtc-warning]");
-    const showRtcWarning = rtcUnavailable && !rtcFallbackActive;
-    rtcWarning.hidden = !showRtcWarning;
+    rtcWarning.hidden = !rtcUnavailable;
     const audioButton = root.querySelector('[data-action="audio-fallback"]');
     const audioMessage = root.querySelector("[data-role=audio-message]");
     if (audioFallbackRequestState === "pending") {
@@ -1003,17 +672,13 @@
       audioMessage.textContent =
         "Щоб не втратити зустріч, увімкніть резервний запис звуку.";
     }
-    if (!rtcFallbackActive) {
-      setStatus(
-        rtcUnavailable || !rtcCaptureEnabled
-          ? "rtc-unavailable"
-          : rtcStatus.channelState === "open" || rtcStatus.decoded > 0
-          ? "capturing-rtc"
-          : "connecting"
-      );
-    } else {
-      setStatus(findCaptionRegion() ? "capturing" : "waiting");
-    }
+    setStatus(
+      rtcUnavailable
+        ? "rtc-unavailable"
+        : rtcStatus.channelState === "open" || rtcStatus.decoded > 0
+        ? "capturing-rtc"
+        : "connecting"
+    );
   }
 
   function mountWidget() {
@@ -1048,7 +713,6 @@
       if (action === "pause") {
         paused = !paused;
         event.target.textContent = paused ? "Продовжити" : "Пауза";
-        if (!paused) scan();
         render();
       }
       if (action === "json") exportJson();
@@ -1088,25 +752,13 @@
     rtcCommand("bind");
     notifyBackground("meeting-transcriber:register");
     mountWidget();
-    applyNativeCaptionVisibility();
     render();
-    connectObserver();
     scanChat();
     scanParticipants();
-    if (rtcCaptureEnabled) {
-      rtcCommand("start");
-      rtcCommand("status");
-      scheduleRtcFallback();
-    } else {
-      const recovery = RtcFallback.recovery(domFallbackEnabled);
-      rtcUnavailable = recovery.rtcUnavailable;
-      rtcFallbackActive = recovery.domFallbackActive;
-      applyNativeCaptionVisibility();
-      if (rtcFallbackActive) maybeEnableCaptions();
-    }
+    rtcCommand("start");
+    rtcCommand("status");
+    scheduleRtcFallback();
     setInterval(() => {
-      connectObserver();
-      maybeEnableCaptions();
       scanChat();
       scanParticipants();
     }, 1500);

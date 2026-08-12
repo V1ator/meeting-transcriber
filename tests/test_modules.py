@@ -7,7 +7,7 @@ from unittest import mock
 
 import modules
 import record
-import watch_and_process as watcher
+import audio_pipeline as audio
 
 
 class ModuleConfigurationTests(unittest.TestCase):
@@ -87,10 +87,10 @@ class ModuleConfigurationTests(unittest.TestCase):
 
 class AudioModuleGateTests(unittest.TestCase):
     def test_watcher_leaves_audio_queue_untouched_when_disabled(self):
-        with mock.patch.object(watcher, "AUDIO_PIPELINE_ENABLED", False):
-            self.assertEqual(watcher.find_ready_sessions(), [])
+        with mock.patch.object(audio, "AUDIO_PIPELINE_ENABLED", False):
+            self.assertEqual(audio.find_ready_sessions(), [])
             with self.assertRaisesRegex(RuntimeError, "Модуль audio вимкнено"):
-                watcher.process_session("session")
+                audio.process_session("session")
 
     def test_direct_recorder_exits_before_requesting_permissions(self):
         with mock.patch.object(record, "AUDIO_PIPELINE_ENABLED", False), \

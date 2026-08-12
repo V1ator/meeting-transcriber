@@ -29,12 +29,11 @@ if ! command -v brew >/dev/null; then
 fi
 ok "brew є"
 
-# ---------- 3. Системні залежності ----------
-step "ffmpeg і Python 3.12"
-brew list ffmpeg >/dev/null 2>&1     || brew install ffmpeg
+# ---------- 3. Базова системна залежність ----------
+step "Python 3.12"
 brew list python@3.12 >/dev/null 2>&1 || brew install python@3.12
 PY="$(brew --prefix python@3.12)/bin/python3.12"
-ok "ffmpeg + $($PY --version)"
+ok "$($PY --version)"
 
 # ---------- 4. venv + python-залежності ----------
 step "Python-оточення"
@@ -43,9 +42,9 @@ if [ ! -d .venv ]; then
     ok "створено .venv"
 fi
 .venv/bin/pip install -q --upgrade pip
-.venv/bin/pip install -q -r requirements.txt
+.venv/bin/pip install -q -r requirements-base.txt
 .venv/bin/pip uninstall -q -y whisperx 2>/dev/null || true
-ok "залежності встановлено"
+ok "базові залежності встановлено"
 
 # ---------- 5. Ollama ----------
 step "Ollama"
@@ -104,7 +103,18 @@ if [ "$NEW_ENV" = true ]; then
     fi
 fi
 
-# ---------- 7. Модель ----------
+# ---------- 7. Опційний аудіомодуль ----------
+if grep -Eq '^AUDIO_PIPELINE_ENABLED=(true|1|yes|on)([[:space:]]|$)' .env; then
+    step "Аудіозалежності"
+    brew list ffmpeg >/dev/null 2>&1 || brew install ffmpeg
+    .venv/bin/pip install -q -r requirements-audio.txt
+    ok "ffmpeg, Whisper і діаризація встановлені"
+else
+    step "Аудіозалежності"
+    ok "пропущено — обрано Meet-only режим"
+fi
+
+# ---------- 8. Модель ----------
 step "LLM-модель"
 MODEL=$(grep '^OLLAMA_MODEL=' .env | cut -d= -f2)
 if curl -sf http://localhost:11434/api/tags 2>/dev/null | grep -Fq "\"$MODEL\""; then
@@ -116,12 +126,12 @@ else
     MANUAL+=("ollama pull $MODEL")
 fi
 
-# ---------- 8. Права на скрипти ----------
+# ---------- 9. Права на скрипти ----------
 chmod +x modules.py toggle_record.sh request_record.sh meeting_rec.5s.sh
 mkdir -p recordings transcripts notes failed logs
 chmod 700 recordings transcripts notes failed logs
 
-# ---------- 9. LaunchAgents (watcher + mic-autostart) ----------
+# ---------- 10. LaunchAgents (watcher + mic-autostart) ----------
 # plist-и генеруються з поточного шляху проекту — папку можна переносити,
 # достатньо перезапустити install.sh.
 step "Фонові сервіси (launchd)"

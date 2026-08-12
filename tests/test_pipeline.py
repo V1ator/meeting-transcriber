@@ -13,6 +13,8 @@ import pipeline_utils
 import mic_watch
 import record
 import transcribe
+import audio_pipeline as audio
+import summary_pipeline as summary_pipeline_module
 import watch_and_process as watcher
 
 
@@ -489,7 +491,7 @@ class MeetingNoteMetadataTests(unittest.TestCase):
 
 [10:30:40] Інтерв’юер: Привіт
 """
-        metadata = watcher._meeting_note_metadata(
+        metadata = audio._meeting_note_metadata(
             "2026-07-30_10-30-40_meet-abc-defg-hij",
             transcript,
             "Згенерована назва",
@@ -508,7 +510,7 @@ class MeetingNoteMetadataTests(unittest.TestCase):
 [14:33] SPEAKER_01: Друга репліка
 [14:34] SPEAKER_00: Ще одна репліка
 """
-        metadata = watcher._meeting_note_metadata(
+        metadata = audio._meeting_note_metadata(
             "2026-07-07_1432",
             transcript,
             "Планування робіт",
@@ -525,7 +527,7 @@ class WatcherStateTests(unittest.TestCase):
     def test_watcher_log_includes_local_date_and_time(self):
         output = io.StringIO()
         with mock.patch("sys.stdout", output):
-            watcher.log("операція почалась")
+            audio.log("операція почалась")
         self.assertRegex(
             output.getvalue(),
             r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] операція почалась\n$",
@@ -542,12 +544,12 @@ class WatcherStateTests(unittest.TestCase):
             def read(self):
                 return b'{"response":"ok"}'
 
-        with mock.patch.object(watcher, "OLLAMA_THINK", False), \
+        with mock.patch.object(summary_pipeline_module, "OLLAMA_THINK", False), \
              mock.patch.object(
-                 watcher.urllib.request, "urlopen", return_value=Response()
+                 summary_pipeline_module.urllib.request, "urlopen", return_value=Response()
              ) as urlopen:
             self.assertEqual(
-                watcher.ollama_generate("prompt", think=True, num_predict=1234),
+                summary_pipeline_module.ollama_generate("prompt", think=True, num_predict=1234),
                 "ok",
             )
         payload = json.loads(urlopen.call_args.args[0].data)
@@ -571,30 +573,30 @@ class WatcherStateTests(unittest.TestCase):
 
         output = io.StringIO()
         with mock.patch.object(
-            watcher.urllib.request, "urlopen", return_value=Response()
+            summary_pipeline_module.urllib.request, "urlopen", return_value=Response()
         ), mock.patch("sys.stdout", output):
-            watcher.ollama_generate("prompt", json_mode=True, num_predict=4096)
+            summary_pipeline_module.ollama_generate("prompt", json_mode=True, num_predict=4096)
         self.assertIn(
             "done_reason=length, output_tokens=4096/4096",
             output.getvalue(),
         )
 
     def test_candidate_reasoning_is_reserved_for_final_assessment(self):
-        with mock.patch.object(watcher, "CANDIDATE_OLLAMA_THINK", True):
+        with mock.patch.object(audio, "CANDIDATE_OLLAMA_THINK", True):
             self.assertEqual(
-                watcher._candidate_generation_options(
+                audio._candidate_generation_options(
                     "Ти витягуєш докази з транскрипту"
                 ),
                 (1200, False),
             )
             self.assertEqual(
-                watcher._candidate_generation_options(
+                audio._candidate_generation_options(
                     "Ти неупереджений hiring assessor"
                 ),
                 (6144, True),
             )
             self.assertEqual(
-                watcher._candidate_generation_options(
+                audio._candidate_generation_options(
                     "Ти форматуєш фінальний hiring report"
                 ),
                 (6144, False),
@@ -614,13 +616,13 @@ class WatcherStateTests(unittest.TestCase):
 [10:00] Jane Doe: Hello
 """
         expected = Path("/tmp/Jane_Doe_2026-07-31.md")
-        with mock.patch.object(watcher, "CANDIDATE_EVALUATION_ENABLED", True), \
+        with mock.patch.object(audio, "CANDIDATE_EVALUATION_ENABLED", True), \
              mock.patch.object(
-                 watcher,
+                 audio,
                  "create_candidate_evaluation_from_transcript",
                  return_value=expected,
              ) as create:
-            result = watcher.create_note_from_transcript(
+            result = audio.create_note_from_transcript(
                 "2026-07-31_100000_meet-abc-defg-hij", transcript
             )
         self.assertEqual(result, expected)
@@ -653,14 +655,14 @@ class WatcherStateTests(unittest.TestCase):
             evaluations = root / "candidate_evaluations"
             recordings.mkdir()
             transcripts.mkdir()
-            with mock.patch.object(watcher.project_paths, "RECORDINGS", recordings), \
-                    mock.patch.object(watcher.project_paths, "TRANSCRIPTS", transcripts), \
+            with mock.patch.object(audio.project_paths, "RECORDINGS", recordings), \
+                    mock.patch.object(audio.project_paths, "TRANSCRIPTS", transcripts), \
                     mock.patch.object(candidate_evaluation, "EVALUATIONS", evaluations), \
-                    mock.patch.object(watcher, "ollama_generate") as generate, \
+                    mock.patch.object(summary_pipeline_module, "ollama_generate") as generate, \
                     mock.patch(
                         "notion_agent.sync_evaluation_feedback_if_enabled"
                     ) as notion_sync:
-                path = watcher.create_candidate_evaluation_from_transcript(
+                path = audio.create_candidate_evaluation_from_transcript(
                     "session",
                     transcript,
                     meeting_date="2026-08-11",
@@ -682,22 +684,22 @@ class WatcherStateTests(unittest.TestCase):
 
 [10:00] Customer: We discuss churn
 """
-        summary = "\n".join(watcher.REQUIRED_HEADINGS)
+        summary = "\n".join(summary_pipeline_module.REQUIRED_HEADINGS)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             for name in ("notes", "recordings", "transcripts"):
                 (root / name).mkdir()
-            with mock.patch.object(watcher, "CANDIDATE_EVALUATION_ENABLED", True), \
-                    mock.patch.object(watcher.project_paths, "NOTES", root / "notes"), \
-                    mock.patch.object(watcher.project_paths, "RECORDINGS", root / "recordings"), \
-                    mock.patch.object(watcher.project_paths, "TRANSCRIPTS", root / "transcripts"), \
-                    mock.patch.object(watcher, "summarize", return_value=summary), \
-                    mock.patch.object(watcher, "make_title", return_value="Churn research"), \
+            with mock.patch.object(audio, "CANDIDATE_EVALUATION_ENABLED", True), \
+                    mock.patch.object(audio.project_paths, "NOTES", root / "notes"), \
+                    mock.patch.object(audio.project_paths, "RECORDINGS", root / "recordings"), \
+                    mock.patch.object(audio.project_paths, "TRANSCRIPTS", root / "transcripts"), \
+                    mock.patch.object(summary_pipeline_module, "summarize", return_value=summary), \
+                    mock.patch.object(summary_pipeline_module, "make_title", return_value="Churn research"), \
                     mock.patch.object(
-                        watcher, "create_candidate_evaluation_from_transcript"
+                        audio, "create_candidate_evaluation_from_transcript"
                     ) as candidate_flow, \
                     mock.patch("notion_agent.sync_note_if_enabled"):
-                note = watcher.create_note_from_transcript("session", transcript)
+                note = audio.create_note_from_transcript("session", transcript)
             self.assertTrue(note.is_file())
             candidate_flow.assert_not_called()
 
@@ -726,9 +728,9 @@ class WatcherStateTests(unittest.TestCase):
                     "merged_labels": ["SPEAKER_01"],
                 }}},
             )
-            with mock.patch.object(watcher.project_paths, "NOTES", notes), \
-                 mock.patch.object(watcher.project_paths, "TRANSCRIPTS", transcripts):
-                watcher.refresh_note_transcript("session")
+            with mock.patch.object(audio.project_paths, "NOTES", notes), \
+                 mock.patch.object(audio.project_paths, "TRANSCRIPTS", transcripts):
+                audio.refresh_note_transcript("session")
             refreshed = note.read_text()
             self.assertIn("[SPEAKER_00] дія", refreshed)
             self.assertIn("[00:00] SPEAKER_00: new", refreshed)
@@ -753,23 +755,23 @@ class WatcherStateTests(unittest.TestCase):
             pipeline_utils.atomic_write_json(
                 transcripts / "session" / "manifest.json", {"quality": {}}
             )
-            with mock.patch.object(watcher.project_paths, "NOTES", notes), \
-                 mock.patch.object(watcher.project_paths, "TRANSCRIPTS", transcripts):
-                watcher.refresh_note_transcript("session")
+            with mock.patch.object(audio.project_paths, "NOTES", notes), \
+                 mock.patch.object(audio.project_paths, "TRANSCRIPTS", transcripts):
+                audio.refresh_note_transcript("session")
             refreshed = note.read_text()
             self.assertIn("| LOCAL_00 | |", refreshed)
             self.assertIn("| LOCAL_01 | |", refreshed)
 
     def test_remote_ollama_requires_explicit_opt_in(self):
-        with mock.patch.object(watcher, "OLLAMA_URL", "https://example.com"), \
-             mock.patch.object(watcher, "ALLOW_REMOTE_OLLAMA", False):
+        with mock.patch.object(summary_pipeline_module, "OLLAMA_URL", "https://example.com"), \
+             mock.patch.object(summary_pipeline_module, "ALLOW_REMOTE_OLLAMA", False):
             with self.assertRaises(RuntimeError):
-                watcher._assert_private_ollama()
+                summary_pipeline_module._assert_private_ollama()
 
     def test_local_ollama_is_allowed(self):
-        with mock.patch.object(watcher, "OLLAMA_URL", "http://127.0.0.1:11434"), \
-             mock.patch.object(watcher, "ALLOW_REMOTE_OLLAMA", False):
-            watcher._assert_private_ollama()
+        with mock.patch.object(summary_pipeline_module, "OLLAMA_URL", "http://127.0.0.1:11434"), \
+             mock.patch.object(summary_pipeline_module, "ALLOW_REMOTE_OLLAMA", False):
+            summary_pipeline_module._assert_private_ollama()
 
     def test_manifest_controls_readiness(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -785,12 +787,12 @@ class WatcherStateTests(unittest.TestCase):
             (recordings / f"{session}_sys.wav").write_bytes(b"sys")
             manifest = recordings / f"{session}.json"
             pipeline_utils.atomic_write_json(manifest, {"status": "recording"})
-            with mock.patch.object(watcher.project_paths, "RECORDINGS", recordings), \
-                 mock.patch.object(watcher.project_paths, "NOTES", notes), \
-                 mock.patch.object(watcher.project_paths, "FAILED", failed):
-                self.assertEqual(watcher.find_ready_sessions(), [])
+            with mock.patch.object(audio.project_paths, "RECORDINGS", recordings), \
+                 mock.patch.object(audio.project_paths, "NOTES", notes), \
+                 mock.patch.object(audio.project_paths, "FAILED", failed):
+                self.assertEqual(audio.find_ready_sessions(), [])
                 pipeline_utils.atomic_write_json(manifest, {"status": "recorded"})
-                self.assertEqual(watcher.find_ready_sessions(), [session])
+                self.assertEqual(audio.find_ready_sessions(), [session])
 
     def test_rotation_handles_complete_and_legacy_sessions_safely(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -807,7 +809,7 @@ class WatcherStateTests(unittest.TestCase):
                 for track in ("mic", "sys"):
                     wav = recordings / f"{session}_{track}.wav"
                     wav.write_bytes(b"audio")
-                    watcher.os.utime(wav, (old, old))
+                    audio.os.utime(wav, (old, old))
                 (notes / f"{session} — Note.md").write_text("note")
                 (transcripts / f"{session}.md").write_text("transcript")
 
@@ -818,13 +820,13 @@ class WatcherStateTests(unittest.TestCase):
                 recordings / "failed.json", {"status": "recording_failed"}
             )
 
-            with mock.patch.object(watcher.project_paths, "RECORDINGS", recordings), \
-                 mock.patch.object(watcher.project_paths, "TRANSCRIPTS", transcripts), \
-                 mock.patch.object(watcher.project_paths, "NOTES", notes), \
-                 mock.patch.object(watcher.project_paths, "FAILED", root / "failed"), \
-                 mock.patch.object(watcher, "ROTATE_DAYS", 5), \
-                 mock.patch.object(watcher.time, "time", return_value=now):
-                watcher.rotate_old_wavs()
+            with mock.patch.object(audio.project_paths, "RECORDINGS", recordings), \
+                 mock.patch.object(audio.project_paths, "TRANSCRIPTS", transcripts), \
+                 mock.patch.object(audio.project_paths, "NOTES", notes), \
+                 mock.patch.object(audio.project_paths, "FAILED", root / "failed"), \
+                 mock.patch.object(audio, "ROTATE_DAYS", 5), \
+                 mock.patch.object(audio.time, "time", return_value=now):
+                audio.rotate_old_wavs()
 
             self.assertFalse(any(recordings.glob("legacy_*.wav")))
             self.assertFalse(any(recordings.glob("complete_*.wav")))
@@ -847,15 +849,15 @@ class WatcherStateTests(unittest.TestCase):
                 "candidate_evaluation": str(marker),
             })
             old = 2_000_000_000.0 - 6 * 86400
-            watcher.os.utime(malicious, (old, old))
+            audio.os.utime(malicious, (old, old))
 
-            with mock.patch.object(watcher.project_paths, "RECORDINGS", recordings), \
-                 mock.patch.object(watcher.project_paths, "TRANSCRIPTS", transcripts), \
-                 mock.patch.object(watcher.project_paths, "NOTES", notes), \
-                 mock.patch.object(watcher.project_paths, "FAILED", failed), \
-                 mock.patch.object(watcher, "ROTATE_DAYS", 5), \
-                 mock.patch.object(watcher.time, "time", return_value=2_000_000_000.0):
-                watcher.rotate_old_wavs()
+            with mock.patch.object(audio.project_paths, "RECORDINGS", recordings), \
+                 mock.patch.object(audio.project_paths, "TRANSCRIPTS", transcripts), \
+                 mock.patch.object(audio.project_paths, "NOTES", notes), \
+                 mock.patch.object(audio.project_paths, "FAILED", failed), \
+                 mock.patch.object(audio, "ROTATE_DAYS", 5), \
+                 mock.patch.object(audio.time, "time", return_value=2_000_000_000.0):
+                audio.rotate_old_wavs()
 
             self.assertTrue(root.is_dir())
             self.assertEqual(marker.read_text(encoding="utf-8"), "safe")
@@ -883,9 +885,9 @@ class WatcherStateTests(unittest.TestCase):
 ## Відкриті питання
 - —
 """
-        self.assertTrue(watcher._valid_summary(complete))
-        self.assertFalse(watcher._valid_summary("## TL;DR\nтільки одна секція"))
-        self.assertFalse(watcher._valid_summary(complete + "\n## Зайва секція\n- ні"))
+        self.assertTrue(summary_pipeline_module._valid_summary(complete))
+        self.assertFalse(summary_pipeline_module._valid_summary("## TL;DR\nтільки одна секція"))
+        self.assertFalse(summary_pipeline_module._valid_summary(complete + "\n## Зайва секція\n- ні"))
 
     def test_evidence_validation_drops_fabricated_quotes(self):
         transcript = "[00:10] Максим: Пропоную почати з ринку США."
@@ -901,7 +903,7 @@ class WatcherStateTests(unittest.TestCase):
                 }
             ]
         }
-        ledger, dropped = watcher._validated_evidence_ledger(raw, transcript)
+        ledger, dropped = summary_pipeline_module._validated_evidence_ledger(raw, transcript)
         self.assertEqual(ledger, {"items": []})
         self.assertEqual(dropped, 1)
 
@@ -918,7 +920,7 @@ class WatcherStateTests(unittest.TestCase):
                 }],
             }]
         }
-        ledger, dropped = watcher._validated_evidence_ledger(raw, transcript)
+        ledger, dropped = summary_pipeline_module._validated_evidence_ledger(raw, transcript)
         self.assertEqual(dropped, 0)
         self.assertEqual(ledger["items"][0]["evidence"][0]["timestamp"], "")
         self.assertEqual(ledger["items"][0]["source_order"], 1)
@@ -944,7 +946,7 @@ class WatcherStateTests(unittest.TestCase):
                 "quote": "Менеджерам зарезервувати слоти 14 та 15 числа",
             }],
         }]}
-        ledger, dropped = watcher._validated_evidence_ledger(raw, transcript)
+        ledger, dropped = summary_pipeline_module._validated_evidence_ledger(raw, transcript)
         self.assertEqual(dropped, 0)
         self.assertEqual(
             ledger["items"][0]["claim"],
@@ -965,7 +967,7 @@ class WatcherStateTests(unittest.TestCase):
                 "quote": "Слоти 14 та 15 числа, понеділок і вівторок",
             }],
         }]}
-        ledger, dropped = watcher._validated_evidence_ledger(raw, transcript)
+        ledger, dropped = summary_pipeline_module._validated_evidence_ledger(raw, transcript)
         self.assertEqual(dropped, 0)
         self.assertEqual(
             ledger["items"][0]["claim"], "Залишити слоти 14 та 15 числа"
@@ -981,7 +983,7 @@ class WatcherStateTests(unittest.TestCase):
                 "quote": "Треба провести співбесіди",
             }],
         }]}
-        ledger, dropped = watcher._validated_evidence_ledger(raw, transcript)
+        ledger, dropped = summary_pipeline_module._validated_evidence_ledger(raw, transcript)
         self.assertEqual(ledger, {"items": []})
         self.assertEqual(dropped, 1)
 
@@ -1002,7 +1004,7 @@ class WatcherStateTests(unittest.TestCase):
                 "quote": "Потрібно підготувати звіт завтра",
             }],
         }]}
-        ledger, dropped = watcher._validated_evidence_ledger(raw, transcript)
+        ledger, dropped = summary_pipeline_module._validated_evidence_ledger(raw, transcript)
         self.assertEqual(dropped, 0)
         self.assertEqual(ledger["items"][0]["speaker"], "External Participant")
         self.assertEqual(ledger["items"][0]["owners"], [])
@@ -1021,7 +1023,7 @@ class WatcherStateTests(unittest.TestCase):
                 "quote": "Я підготую звіт завтра",
             }],
         }]}
-        ledger, _ = watcher._validated_evidence_ledger(raw, transcript)
+        ledger, _ = summary_pipeline_module._validated_evidence_ledger(raw, transcript)
         self.assertEqual(ledger["items"][0]["speaker"], "Current User")
         self.assertEqual(ledger["items"][0]["owners"], ["Current User"])
 
@@ -1038,7 +1040,7 @@ class WatcherStateTests(unittest.TestCase):
                 "quote": "Я надішлю інструкцію завтра",
             }],
         }]}
-        ledger, _ = watcher._validated_evidence_ledger(raw, transcript)
+        ledger, _ = summary_pipeline_module._validated_evidence_ledger(raw, transcript)
         self.assertEqual(ledger["items"][0]["owners"], ["Current User"])
 
     def test_unaccepted_advice_is_downgraded_from_decision(self):
@@ -1051,7 +1053,7 @@ class WatcherStateTests(unittest.TestCase):
                 "quote": "Просто кажіть про свою особисту історію",
             }],
         }
-        normalized = watcher._normalize_evidence_lifecycle([item])
+        normalized = summary_pipeline_module._normalize_evidence_lifecycle([item])
         self.assertEqual(normalized[0]["type"], "proposal")
         self.assertEqual(normalized[0]["status"], "open")
 
@@ -1065,7 +1067,7 @@ class WatcherStateTests(unittest.TestCase):
                 "quote": "Якщо будуть питати, то можна сказати, що все чесно",
             }],
         }
-        normalized = watcher._normalize_evidence_lifecycle([item])
+        normalized = summary_pipeline_module._normalize_evidence_lifecycle([item])
         self.assertEqual(normalized[0]["type"], "proposal")
 
     def test_foreign_language_claim_falls_back_to_grounded_quote(self):
@@ -1077,7 +1079,7 @@ class WatcherStateTests(unittest.TestCase):
                 "quote": "Залишаємо допомогу Олени як резервний варіант",
             }],
         }
-        grounded = watcher._ground_claim_language([item])
+        grounded = summary_pipeline_module._ground_claim_language([item])
         self.assertEqual(
             grounded[0]["claim"],
             "Залишаємо допомогу Олени як резервний варіант",
@@ -1096,7 +1098,7 @@ class WatcherStateTests(unittest.TestCase):
             "claim": "Створити шаблон офера, в якому рекрутер підставить ім'я",
             "evidence": [{"quote": "зробити темплейт оферу", "source_line": 5}],
         }
-        deduplicated = watcher._deduplicate_evidence_items([first, second])
+        deduplicated = summary_pipeline_module._deduplicate_evidence_items([first, second])
         self.assertEqual(len(deduplicated), 1)
         self.assertEqual(deduplicated[0]["type"], "proposal")
 
@@ -1114,7 +1116,7 @@ class WatcherStateTests(unittest.TestCase):
             "evidence": [{"quote": "да зроблю", "source_line": 146}],
         }
         self.assertEqual(
-            len(watcher._deduplicate_evidence_items([first, second])), 1
+            len(summary_pipeline_module._deduplicate_evidence_items([first, second])), 1
         )
 
     def test_closing_excerpt_selects_last_eight_minutes(self):
@@ -1125,7 +1127,7 @@ class WatcherStateTests(unittest.TestCase):
             "[18:02:30] A: Фінальний підсумок",
             "[18:10:00] B: Завершення",
         ])
-        excerpt = watcher._closing_transcript_excerpt(transcript)
+        excerpt = summary_pipeline_module._closing_transcript_excerpt(transcript)
         self.assertNotIn("Початок", excerpt)
         self.assertNotIn("Проміжний варіант", excerpt)
         self.assertIn("Фінальний підсумок", excerpt)
@@ -1150,12 +1152,12 @@ class WatcherStateTests(unittest.TestCase):
             }]
         }, ensure_ascii=False)
         generate = mock.Mock(side_effect=[raw, json.dumps({"items": []})])
-        with mock.patch.object(watcher, "ollama_generate", generate):
-            ledger = watcher._generate_evidence_ledger(
+        with mock.patch.object(summary_pipeline_module, "ollama_generate", generate):
+            ledger = summary_pipeline_module._generate_evidence_ledger(
                 "context prompt",
                 transcript,
                 stage="context",
-                allowed_types=watcher.CONTEXT_EVIDENCE_TYPES,
+                allowed_types=summary_pipeline_module.CONTEXT_EVIDENCE_TYPES,
             )
         self.assertEqual(ledger, {"items": []})
         self.assertEqual(generate.call_count, 2)
@@ -1165,13 +1167,13 @@ class WatcherStateTests(unittest.TestCase):
             '{"items":[',
             json.dumps({"items": []}),
         ])
-        with mock.patch.object(watcher, "ollama_generate", generate):
-            ledger = watcher._generate_evidence_ledger(
+        with mock.patch.object(summary_pipeline_module, "ollama_generate", generate):
+            ledger = summary_pipeline_module._generate_evidence_ledger(
                 "merge prompt",
                 "transcript",
                 stage="context evidence merge",
                 num_predict=4096,
-                allowed_types=watcher.CONTEXT_EVIDENCE_TYPES,
+                allowed_types=summary_pipeline_module.CONTEXT_EVIDENCE_TYPES,
                 repair_item_limit=5,
             )
         self.assertEqual(ledger, {"items": []})
@@ -1185,10 +1187,10 @@ class WatcherStateTests(unittest.TestCase):
         )
 
     def test_critical_merge_has_larger_output_budget(self):
-        self.assertEqual(watcher.SUMMARY_CONTEXT_NUM_PREDICT, 4096)
-        self.assertEqual(watcher.SUMMARY_CONTEXT_REPAIR_ITEMS, 5)
-        self.assertEqual(watcher.SUMMARY_CRITICAL_MERGE_NUM_PREDICT, 8192)
-        self.assertEqual(watcher.SUMMARY_CRITICAL_RECONCILE_NUM_PREDICT, 8192)
+        self.assertEqual(summary_pipeline_module.SUMMARY_CONTEXT_NUM_PREDICT, 4096)
+        self.assertEqual(summary_pipeline_module.SUMMARY_CONTEXT_REPAIR_ITEMS, 5)
+        self.assertEqual(summary_pipeline_module.SUMMARY_CRITICAL_MERGE_NUM_PREDICT, 8192)
+        self.assertEqual(summary_pipeline_module.SUMMARY_CRITICAL_RECONCILE_NUM_PREDICT, 8192)
 
     def test_grounded_sections_do_not_promote_recommendations_or_completed_work(self):
         draft = """## TL;DR
@@ -1234,11 +1236,11 @@ class WatcherStateTests(unittest.TestCase):
                 },
             ]
         }
-        summary = watcher._render_grounded_sections(draft, ledger)
+        summary = summary_pipeline_module._render_grounded_sections(draft, ledger)
         self.assertNotIn("Обговорили запуск.", summary)
         self.assertIn("Явні рішення: Проводити щотижневий sync.", summary)
-        decisions = watcher._summary_section(summary, "## Рішення")
-        actions = watcher._summary_section(summary, "## Action items")
+        decisions = summary_pipeline_module._summary_section(summary, "## Рішення")
+        actions = summary_pipeline_module._summary_section(summary, "## Action items")
         self.assertEqual(decisions, "- Проводити щотижневий sync")
         self.assertIn("[Інтерв’юер] Проаналізувати конкурентів", actions)
         self.assertIn("Спробувати організувати", actions)
@@ -1266,12 +1268,12 @@ class WatcherStateTests(unittest.TestCase):
                 "deadline": "",
             },
         ]}
-        summary = watcher._render_grounded_sections(
-            watcher.SUMMARY_TEMPLATE, ledger
+        summary = summary_pipeline_module._render_grounded_sections(
+            summary_pipeline_module.SUMMARY_TEMPLATE, ledger
         )
-        theses = watcher._summary_section(summary, "## Основні тези")
-        questions = watcher._summary_section(summary, "## Відкриті питання")
-        actions = watcher._summary_section(summary, "## Action items")
+        theses = summary_pipeline_module._summary_section(summary, "## Основні тези")
+        questions = summary_pipeline_module._summary_section(summary, "## Відкриті питання")
+        actions = summary_pipeline_module._summary_section(summary, "## Action items")
         self.assertIn("Пропозиція: Підготувати QR-коди", theses)
         self.assertNotIn("QR-коди", questions)
         self.assertEqual(questions, "- Чи буде інтернатура?")
@@ -1306,12 +1308,12 @@ class WatcherStateTests(unittest.TestCase):
                 "Рішення явно підтверджене і не скасоване.",
                 raw_ledger,
             ])
-            with mock.patch.object(watcher.project_paths, "TRANSCRIPTS", transcripts), \
-                    mock.patch.object(watcher, "ollama_generate", generate), \
-                    mock.patch.object(watcher, "SUMMARY_EXTRACT_THINK", False), \
-                    mock.patch.object(watcher, "SUMMARY_RECONCILE_THINK", True):
-                summary = watcher.summarize(session, transcript)
-                second = watcher.summarize(session, transcript)
+            with mock.patch.object(audio.project_paths, "TRANSCRIPTS", transcripts), \
+                    mock.patch.object(summary_pipeline_module, "ollama_generate", generate), \
+                    mock.patch.object(summary_pipeline_module, "SUMMARY_EXTRACT_THINK", False), \
+                    mock.patch.object(summary_pipeline_module, "SUMMARY_RECONCILE_THINK", True):
+                summary = summary_pipeline_module.summarize(session, transcript)
+                second = summary_pipeline_module.summarize(session, transcript)
             evidence = json.loads(
                 (transcripts / session / "summary-evidence.json").read_text()
             )
@@ -1324,7 +1326,7 @@ class WatcherStateTests(unittest.TestCase):
         self.assertFalse(generate.call_args_list[2].kwargs["json_mode"])
         self.assertTrue(generate.call_args_list[3].kwargs["json_mode"])
         self.assertEqual(evidence["items"][0]["type"], "decision")
-        self.assertTrue(watcher._valid_summary(summary))
+        self.assertTrue(summary_pipeline_module._valid_summary(summary))
 
     def test_reconciliation_supersedes_rejected_locale_limit(self):
         transcript = """[14:09:49] Andrii: Давайте візьмемо ікс локалей, не всі п'ятнадцять.
@@ -1380,18 +1382,18 @@ class WatcherStateTests(unittest.TestCase):
                 "Пізніша репліка відхиляє початкове обмеження локалей.",
                 reconciled_raw,
             ])
-            with mock.patch.object(watcher.project_paths, "TRANSCRIPTS", transcripts), \
-                    mock.patch.object(watcher, "ollama_generate", generate), \
-                    mock.patch.object(watcher, "SUMMARY_EXTRACT_THINK", False), \
-                    mock.patch.object(watcher, "SUMMARY_RECONCILE_THINK", True):
-                summary = watcher.summarize(session, transcript)
+            with mock.patch.object(audio.project_paths, "TRANSCRIPTS", transcripts), \
+                    mock.patch.object(summary_pipeline_module, "ollama_generate", generate), \
+                    mock.patch.object(summary_pipeline_module, "SUMMARY_EXTRACT_THINK", False), \
+                    mock.patch.object(summary_pipeline_module, "SUMMARY_RECONCILE_THINK", True):
+                summary = summary_pipeline_module.summarize(session, transcript)
             reasoning_call = generate.call_args_list[2]
             reconcile_call = generate.call_args_list[3]
             evidence = json.loads(
                 (transcripts / session / "summary-evidence.json").read_text()
             )
 
-        decisions = watcher._summary_section(summary, "## Рішення")
+        decisions = summary_pipeline_module._summary_section(summary, "## Рішення")
         self.assertEqual(decisions, "- Не встановлювати жорсткого ліміту локалей")
         self.assertNotIn("Обмежити роботу кількома локалями", decisions)
         self.assertTrue(reasoning_call.kwargs["think"])
@@ -1415,13 +1417,13 @@ class WatcherStateTests(unittest.TestCase):
                 recordings / f"{session}.json",
                 {"status": "recorded", "processing_attempts": 0},
             )
-            with mock.patch.object(watcher.project_paths, "RECORDINGS", recordings), \
-                 mock.patch.object(watcher.project_paths, "FAILED", failed), \
-                 mock.patch.object(watcher.project_paths, "NOTES", notes):
+            with mock.patch.object(audio.project_paths, "RECORDINGS", recordings), \
+                 mock.patch.object(audio.project_paths, "FAILED", failed), \
+                 mock.patch.object(audio.project_paths, "NOTES", notes):
                 try:
                     raise RuntimeError("secret hf_SUPERSECRET ntn_NOTIONSECRET")
                 except RuntimeError:
-                    watcher.handle_failure(session)
+                    audio.handle_failure(session)
             manifest = json.loads((recordings / f"{session}.json").read_text())
             error_file = failed / f"{session}.log"
             self.assertEqual(manifest["status"], "processing_failed")
@@ -1443,13 +1445,13 @@ class WatcherStateTests(unittest.TestCase):
                 recordings / f"{session}.json",
                 {
                     "status": "processing",
-                    "processing_attempts": watcher.MAX_AUTO_RETRIES,
+                    "processing_attempts": audio.MAX_AUTO_RETRIES,
                 },
             )
-            with mock.patch.object(watcher.project_paths, "RECORDINGS", recordings), \
-                    mock.patch.object(watcher.project_paths, "NOTES", notes), \
-                    mock.patch.object(watcher, "AUDIO_PIPELINE_ENABLED", True):
-                self.assertEqual(watcher.find_ready_sessions(), [])
+            with mock.patch.object(audio.project_paths, "RECORDINGS", recordings), \
+                    mock.patch.object(audio.project_paths, "NOTES", notes), \
+                    mock.patch.object(audio, "AUDIO_PIPELINE_ENABLED", True):
+                self.assertEqual(audio.find_ready_sessions(), [])
             manifest = json.loads(
                 (recordings / f"{session}.json").read_text(encoding="utf-8")
             )
@@ -1468,14 +1470,14 @@ class WatcherStateTests(unittest.TestCase):
                 recordings / f"{session}.json",
                 {
                     "status": "processing_failed",
-                    "processing_attempts": watcher.MAX_AUTO_RETRIES,
+                    "processing_attempts": audio.MAX_AUTO_RETRIES,
                     "next_retry_at": 0,
                 },
             )
-            with mock.patch.object(watcher.project_paths, "RECORDINGS", recordings), \
-                    mock.patch.object(watcher.project_paths, "NOTES", notes), \
-                    mock.patch.object(watcher, "AUDIO_PIPELINE_ENABLED", True):
-                self.assertEqual(watcher.find_ready_sessions(), [])
+            with mock.patch.object(audio.project_paths, "RECORDINGS", recordings), \
+                    mock.patch.object(audio.project_paths, "NOTES", notes), \
+                    mock.patch.object(audio, "AUDIO_PIPELINE_ENABLED", True):
+                self.assertEqual(audio.find_ready_sessions(), [])
             manifest = json.loads(
                 (recordings / f"{session}.json").read_text(encoding="utf-8")
             )
@@ -1501,12 +1503,12 @@ class WatcherStateTests(unittest.TestCase):
             pipeline_utils.atomic_write_json(
                 recordings / f"{session}.json", {"status": "recorded"}
             )
-            with mock.patch.object(watcher.project_paths, "RECORDINGS", recordings), \
-                 mock.patch.object(watcher.project_paths, "TRANSCRIPTS", transcripts), \
-                 mock.patch.object(watcher.project_paths, "NOTES", notes), \
-                 mock.patch.object(watcher.project_paths, "FAILED", failed), \
-                 mock.patch.object(watcher, "MIN_SESSION_SECONDS", 10):
-                watcher.process_session(session)
+            with mock.patch.object(audio.project_paths, "RECORDINGS", recordings), \
+                 mock.patch.object(audio.project_paths, "TRANSCRIPTS", transcripts), \
+                 mock.patch.object(audio.project_paths, "NOTES", notes), \
+                 mock.patch.object(audio.project_paths, "FAILED", failed), \
+                 mock.patch.object(audio, "MIN_SESSION_SECONDS", 10):
+                audio.process_session(session)
             manifest = json.loads((recordings / f"{session}.json").read_text())
             self.assertEqual(manifest["status"], "complete")
             self.assertEqual(len(list(notes.glob("*.md"))), 1)
@@ -1533,13 +1535,13 @@ class WatcherStateTests(unittest.TestCase):
             pipeline_utils.atomic_write_json(
                 recordings / f"{session}.json", {"status": "recorded"}
             )
-            with mock.patch.object(watcher.project_paths, "RECORDINGS", recordings), \
-                 mock.patch.object(watcher.project_paths, "TRANSCRIPTS", transcripts), \
-                 mock.patch.object(watcher.project_paths, "NOTES", notes), \
-                 mock.patch.object(watcher.project_paths, "FAILED", failed), \
-                 mock.patch.object(watcher, "MIN_SESSION_SECONDS", 10), \
-                 mock.patch.object(watcher.subprocess, "run") as run:
-                watcher.process_session(session)
+            with mock.patch.object(audio.project_paths, "RECORDINGS", recordings), \
+                 mock.patch.object(audio.project_paths, "TRANSCRIPTS", transcripts), \
+                 mock.patch.object(audio.project_paths, "NOTES", notes), \
+                 mock.patch.object(audio.project_paths, "FAILED", failed), \
+                 mock.patch.object(audio, "MIN_SESSION_SECONDS", 10), \
+                 mock.patch.object(audio.subprocess, "run") as run:
+                audio.process_session(session)
             manifest = json.loads((recordings / f"{session}.json").read_text())
             self.assertEqual(manifest["stage"], "silent-recording")
             self.assertLess(manifest["signal"]["mic"]["peak_dbfs"], -200)
