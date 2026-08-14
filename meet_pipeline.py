@@ -43,6 +43,9 @@ _require_safe_session_id = audio_pipeline._require_safe_session_id
 note_for = audio_pipeline.note_for
 manifest_path = audio_pipeline.manifest_path
 create_note_from_transcript = audio_pipeline.create_note_from_transcript
+create_meet_capture_failure_note = (
+    audio_pipeline.create_meet_capture_failure_note
+)
 handle_failure = audio_pipeline.handle_failure
 log = audio_pipeline.log
 
@@ -126,15 +129,16 @@ def find_ready_meet_sessions(*, now: float | None = None) -> list[str]:
         status = manifest.get("status")
         attempts = int(manifest.get("processing_attempts", 0) or 0)
         retry_at = float(manifest.get("next_retry_at", 0) or 0)
+        if status in {"complete", "terminal_failed"}:
+            continue
         if attempts >= MAX_AUTO_RETRIES:
-            if status != "terminal_failed":
-                update_manifest(
-                    path,
-                    status="terminal_failed",
-                    stage="interrupted",
-                    next_retry_at=None,
-                    last_error="Обробку перервано під час останньої спроби",
-                )
+            update_manifest(
+                path,
+                status="terminal_failed",
+                stage="interrupted",
+                next_retry_at=None,
+                last_error="Обробку перервано під час останньої спроби",
+            )
             continue
         if status == "processing" or (
             status == "processing_failed" and current >= retry_at
@@ -168,8 +172,15 @@ def retry_meet_session(session: str) -> Path:
             note = create_note_from_transcript(
                 session, transcript_path.read_text(encoding="utf-8")
             )
-        except Exception:
-            handle_failure(session)
+        except Exception as exc:
+            from candidate_evaluation import CandidateEvaluationTerminalError
+
+            handle_failure(
+                session,
+                terminal_override=isinstance(
+                    exc, CandidateEvaluationTerminalError
+                ),
+            )
             raise
         update_manifest(
             manifest_path(session),
@@ -180,6 +191,7 @@ def retry_meet_session(session: str) -> Path:
             next_retry_at=None,
             last_error=None,
         )
+        (project_paths.FAILED / f"{session}.log").unlink(missing_ok=True)
     log(f"Meet retry: {session} → {note}")
     return note
 
@@ -256,6 +268,7 @@ def process_meet_exports(*, now: float | None = None) -> int:
             signature = (stat.st_size, stat.st_mtime_ns)
             data = meet_import.load_export(source)
             session = meet_import.session_id(data)
+            diagnostic_only = meet_import.is_diagnostic_export(data)
             transcript_path = project_paths.TRANSCRIPTS / f"{session}.md"
             if transcript_path.exists():
                 previous = read_json(
@@ -316,11 +329,17 @@ def process_meet_exports(*, now: float | None = None) -> int:
                         processing_started_at=utc_now(),
                     )
                     transcript = transcript_path.read_text(encoding="utf-8")
-                    note = create_note_from_transcript(session, transcript)
+                    if diagnostic_only:
+                        note = create_meet_capture_failure_note(
+                            session, transcript
+                        )
+                    else:
+                        note = create_note_from_transcript(session, transcript)
                     update_manifest(
                         manifest_path(session),
                         status="complete",
                         stage="complete",
+                        capture_failed=diagnostic_only,
                         note=str(note),
                         completed_at=utc_now(),
                         next_retry_at=None,
@@ -342,7 +361,14 @@ def process_meet_exports(*, now: float | None = None) -> int:
             _meet_export_errors.pop(source, None)
         except Exception as exc:
             if session and transcript_path and transcript_path.exists() and MEET_AUTO_SUMMARY:
-                handle_failure(session)
+                from candidate_evaluation import CandidateEvaluationTerminalError
+
+                handle_failure(
+                    session,
+                    terminal_override=isinstance(
+                        exc, CandidateEvaluationTerminalError
+                    ),
+                )
             elif signature is not None and _meet_export_errors.get(source) != signature:
                 log(f"Meet auto-import пропущено: {source.name} ({exc})")
                 _meet_export_errors[source] = signature

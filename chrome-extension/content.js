@@ -2,9 +2,11 @@
   "use strict";
 
   const Model = globalThis.MeetingCaptionModel;
+  const CaptionControl = globalThis.MeetingCaptionControl;
   const AutoExport = globalThis.MeetingAutoExport;
   const RtcFallback = globalThis.MeetingRtcFallback;
   const STORAGE_PREFIX = "meeting-transcriber:";
+  const DIAGNOSTIC_STORAGE_PREFIX = "meeting-transcriber:diagnostic:";
   const SETTINGS_KEY = "meeting-transcriber:settings";
   const FINALIZE_DELAY_MS = 1800;
   const RTC_FALLBACK_DELAY_MS = 20_000;
@@ -28,12 +30,16 @@
     "[data-participant-id], [data-requested-participant-id]";
 
   let meetingCode = "";
+  let sessionStorageKey = "";
   let state = null;
   let paused = false;
   let saveTimer = null;
   let settingsSaveTimer = null;
   let startedEpoch = Date.now();
   let autoExportEnabled = true;
+  let autoAudioFallbackEnabled = true;
+  let passiveDiagnosticMode = false;
+  let passiveSession = false;
   let captureChat = true;
   let speakerAliases = {};
   let speakerNameAliases = {};
@@ -43,6 +49,8 @@
   let rtcFallbackRequiresReconnect = false;
   let audioFallbackRequestState = "idle";
   let audioFallbackResetTimer = null;
+  let audioFallbackAttempted = false;
+  let audioFallbackRequestedAutomatically = false;
   let rtcStatus = {
     ready: false,
     channelState: "missing",
@@ -73,7 +81,7 @@
   }
 
   function storageKey() {
-    return `${STORAGE_PREFIX}${meetingCode}`;
+    return sessionStorageKey || `${STORAGE_PREFIX}${meetingCode}`;
   }
 
   function pageMeetingTitle() {
@@ -185,22 +193,116 @@
       Number(health.decodeFailures) || 0,
       Number(rtcStatus.failures) || 0
     );
+    health.rtcPackets = Math.max(
+      Number(health.rtcPackets) || 0,
+      Number(rtcStatus.packets) || 0
+    );
     health.finalizedAtMs = elapsedMs();
+    health.captureMode = passiveDiagnosticMode ? "rtc-observer" : "rtc-direct";
+    health.captionActivationState = passiveDiagnosticMode
+      ? "unchanged"
+      : rtcStatus.languageActivationState || "pending";
+    health.captionActivationReason = passiveDiagnosticMode
+      ? "passive-diagnostic-mode"
+      : "direct-rtc-media-session";
+    health.captionEnableAttempts = passiveDiagnosticMode
+      ? 0
+      : Math.max(0, Number(rtcStatus.languageActivationAttempts) || 0);
+    health.mediaSessionState = String(
+      rtcStatus.mediaSessionState || "missing"
+    ).slice(0, 40);
+    health.captionLanguage = String(rtcStatus.captionLanguage || "").slice(0, 20);
+    health.captionLanguageConfirmed = Boolean(
+      rtcStatus.languageActivationConfirmed
+    );
+    health.captionsActivatedByExtension = false;
+    health.nativeCaptionDisplayState = "unchanged";
+    health.nativeCaptionHideReason = passiveDiagnosticMode
+      ? "passive-diagnostic-mode"
+      : "direct-rtc-no-dom-changes";
+    health.nativeCaptionsHiddenByExtension = false;
+    health.passiveDiagnosticMode = passiveDiagnosticMode;
+    health.rtcObserverOnly = Boolean(rtcStatus.observerOnly);
+    health.rtcChannelOpenAttempts = Math.max(
+      Number(health.rtcChannelOpenAttempts) || 0,
+      Number(rtcStatus.openAttempts) || 0
+    );
+    health.observedDataChannels = Array.isArray(rtcStatus.observedChannels)
+      ? rtcStatus.observedChannels.slice(0, 50).map((channel) => ({
+        label: String(channel?.label || "").slice(0, 120),
+        origin: String(channel?.origin || "").slice(0, 20),
+        count: Math.max(0, Math.min(Number(channel?.count) || 0, 10_000)),
+      }))
+      : [];
+    if (CaptionControl?.diagnose) {
+      health.captionControlDiagnostic = CaptionControl.diagnose(document);
+      health.captionControlSeen =
+        health.captionControlDiagnostic.possibleControls > 0;
+    }
     return health;
   }
 
+  function sanitizedPacketDiagnostic(value) {
+    const allowedKinds = new Set([
+      "bytes", "device-id", "fixed32", "fixed64", "language-code",
+      "message", "utf8", "varint",
+    ]);
+    let remaining = 48;
+    function fields(items, depth = 0) {
+      if (!Array.isArray(items) || depth > 5) return [];
+      const result = [];
+      for (const item of items) {
+        if (remaining <= 0 || !item || typeof item !== "object") break;
+        const field = Number(item.field);
+        const wire = Number(item.wire);
+        const kind = String(item.kind || "");
+        if (!Number.isInteger(field) || field <= 0
+            || ![0, 1, 2, 5].includes(wire) || !allowedKinds.has(kind)) continue;
+        remaining -= 1;
+        const clean = { field, wire, kind };
+        if (Number.isInteger(item.length) && item.length >= 0) {
+          clean.length = Math.min(item.length, 1_000_000);
+        }
+        if (Number.isInteger(item.characters) && item.characters >= 0) {
+          clean.characters = Math.min(item.characters, 20_000);
+        }
+        const nested = fields(item.fields, depth + 1);
+        if (nested.length) clean.fields = nested;
+        result.push(clean);
+      }
+      return result;
+    }
+    if (!value || typeof value !== "object" || value.redacted !== true) return null;
+    const byteLength = Number(value.byteLength);
+    if (!Number.isInteger(byteLength) || byteLength <= 0) return null;
+    return {
+      schemaVersion: 1,
+      byteLength: Math.min(byteLength, 1_000_000),
+      parsedAsProtobuf: Boolean(value.parsedAsProtobuf),
+      fields: fields(value.fields),
+      redacted: true,
+    };
+  }
+
   async function loadState() {
-    const stored = await storageGet([storageKey(), SETTINGS_KEY]);
-    let seed = stored[storageKey()] || {};
+    const settingsStored = await storageGet([SETTINGS_KEY]);
+    const settings = settingsStored[SETTINGS_KEY] || {};
+    passiveDiagnosticMode = settings.passiveDiagnosticMode === true;
+    passiveSession = passiveDiagnosticMode;
+    sessionStorageKey = passiveDiagnosticMode
+      ? `${DIAGNOSTIC_STORAGE_PREFIX}${meetingCode}`
+      : `${STORAGE_PREFIX}${meetingCode}`;
+    const sessionStored = await storageGet([storageKey()]);
+    let seed = sessionStored[storageKey()] || {};
     const seedStartedAt = Date.parse(seed.startedAt || "");
     if (Number.isFinite(seedStartedAt)
         && Date.now() - seedStartedAt > 12 * 60 * 60 * 1000) {
       seed = {};
       await storageRemove(storageKey());
     }
-    speakerAliases = sanitizedAliasMap(stored[SETTINGS_KEY]?.speakerAliases);
+    speakerAliases = sanitizedAliasMap(settings.speakerAliases);
     speakerNameAliases = sanitizedAliasMap(
-      stored[SETTINGS_KEY]?.speakerNameAliases
+      settings.speakerNameAliases
     );
     rtcSpeakerNames.clear();
     Object.entries(speakerAliases).forEach(([deviceId, name]) => {
@@ -212,12 +314,15 @@
       meetingTitle: pageMeetingTitle(),
       language: seed.language || "uk",
     });
+    if (!state.startedAt) state.startedAt = new Date(startedEpoch).toISOString();
     if (state.startedAt) {
       const parsed = Date.parse(state.startedAt);
       if (Number.isFinite(parsed)) startedEpoch = parsed;
     }
-    autoExportEnabled = stored[SETTINGS_KEY]?.autoExportEnabled !== false;
-    captureChat = stored[SETTINGS_KEY]?.captureChat !== false;
+    autoExportEnabled = settings.autoExportEnabled !== false;
+    autoAudioFallbackEnabled =
+      settings.autoAudioFallbackEnabled !== false;
+    captureChat = settings.captureChat !== false;
     const knownParticipants = (state.participants || []).map(canonicalSpeakerName);
     state.entries.forEach((entry) => {
       const alias = entry.speakerId
@@ -228,7 +333,7 @@
     state.participants = [];
     knownParticipants.forEach((name) => Model.addParticipant(state, name));
     state.entries.forEach((entry) => Model.addParticipant(state, entry.speaker));
-    const savedPosition = stored[SETTINGS_KEY]?.widgetPosition;
+    const savedPosition = settings.widgetPosition;
     if (Number.isFinite(savedPosition?.x) && Number.isFinite(savedPosition?.y)) {
       widgetPosition = { x: savedPosition.x, y: savedPosition.y };
     }
@@ -238,6 +343,8 @@
     await storageSet({
       [SETTINGS_KEY]: {
         autoExportEnabled,
+        autoAudioFallbackEnabled,
+        passiveDiagnosticMode,
         captureChat,
         speakerAliases,
         speakerNameAliases,
@@ -273,8 +380,14 @@
   }
 
   function rtcCommand(type) {
+    const configuredLanguage = String(state?.language || "uk");
+    const languageCode = configuredLanguage.includes("-")
+      ? configuredLanguage
+      : configuredLanguage.toLowerCase() === "uk"
+        ? "uk-UA"
+        : configuredLanguage;
     document.dispatchEvent(new CustomEvent(RTC_COMMAND_NAME, {
-      detail: { type, nonce: RTC_SESSION_NONCE },
+      detail: { type, nonce: RTC_SESSION_NONCE, languageCode },
     }));
   }
 
@@ -452,8 +565,59 @@
     render();
   }
 
+  async function requestAudioFallback({ automatic = false } = {}) {
+    if (passiveDiagnosticMode) return;
+    if (audioFallbackRequestState === "pending"
+        || audioFallbackRequestState === "sent") return;
+    if (automatic && audioFallbackAttempted) return;
+    audioFallbackAttempted = true;
+    audioFallbackRequestedAutomatically = automatic;
+    clearTimeout(audioFallbackResetTimer);
+    audioFallbackRequestState = "pending";
+    render();
+    try {
+      const response = await globalThis.chrome?.runtime?.sendMessage?.({
+        type: "meeting-transcriber:start-backup-audio",
+        meetingCode,
+      });
+      audioFallbackRequestState = response?.ok ? "sent" : "failed";
+    } catch {
+      audioFallbackRequestState = "failed";
+    }
+    render();
+    if (audioFallbackRequestState === "sent") {
+      audioFallbackResetTimer = setTimeout(() => {
+        audioFallbackRequestState = "idle";
+        render();
+      }, 30_000);
+    }
+  }
+
+  function activateRtcFallback(reason) {
+    if (passiveDiagnosticMode) {
+      const health = refreshCaptureHealth();
+      health.lastFailureReason = reason || "rtc-unavailable";
+      scheduleSave();
+      render();
+      return;
+    }
+    rtcUnavailable = true;
+    const health = refreshCaptureHealth();
+    health.hadRtcUnavailable = true;
+    health.lastFailureReason = reason || "rtc-unavailable";
+    scheduleSave();
+    render();
+    if (autoAudioFallbackEnabled) {
+      requestAudioFallback({ automatic: true }).catch(() => {});
+    }
+  }
+
   function scheduleRtcFallback() {
     clearTimeout(rtcFallbackTimer);
+    if (passiveDiagnosticMode) {
+      rtcFallbackDeadline = 0;
+      return;
+    }
     const now = Date.now();
     const effectiveDecoded = rtcFallbackRequiresReconnect
       ? 0
@@ -463,7 +627,9 @@
       now,
       RTC_FALLBACK_DELAY_MS,
       effectiveDecoded,
-      rtcStatus.channelState
+      rtcStatus.channelState,
+      rtcStatus.packets,
+      rtcStatus.failures
     );
     if (!rtcFallbackDeadline) return;
     rtcFallbackTimer = setTimeout(() => {
@@ -471,17 +637,16 @@
         rtcFallbackDeadline,
         Date.now(),
         rtcFallbackRequiresReconnect ? 0 : rtcStatus.decoded,
-        rtcStatus.channelState
+        rtcStatus.channelState,
+        rtcStatus.packets,
+        rtcStatus.failures
       )) {
         scheduleRtcFallback();
         return;
       }
-      rtcUnavailable = true;
-      const health = captureHealth();
-      health.hadRtcUnavailable = true;
-      health.lastFailureReason = "startup-timeout";
-      scheduleSave();
-      render();
+      const decodeStalled = rtcStatus.decoded === 0
+        && rtcStatus.packets > 0 && rtcStatus.failures > 0;
+      activateRtcFallback(decodeStalled ? "decode-stall" : "startup-timeout");
     }, Math.max(0, rtcFallbackDeadline - now));
   }
 
@@ -490,7 +655,7 @@
     if (detail.nonce !== RTC_SESSION_NONCE) return;
     if (detail.type === "ready") {
       rtcStatus.ready = true;
-      rtcCommand("start");
+      rtcCommand(passiveDiagnosticMode ? "observe" : "start");
       render();
       return;
     }
@@ -522,23 +687,38 @@
       Number(health.decodeFailures) || 0,
       Number(detail.failures) || 0,
     );
+    health.rtcPackets = Math.max(
+      Number(health.rtcPackets) || 0,
+      Number(detail.packets) || 0,
+    );
+    const packetDiagnostic = sanitizedPacketDiagnostic(
+      detail.unparsedPacketSample
+    );
+    if (packetDiagnostic && !health.unparsedPacketSample) {
+      health.unparsedPacketSample = packetDiagnostic;
+    }
+    const decodeStalled = Number(detail.decoded) === 0
+      && Number(detail.packets) > 0 && Number(detail.failures) > 0;
     if (
       detail.reason === "unsupported"
       || (detail.failures >= 3 && detail.decoded === 0)
     ) {
-      rtcUnavailable = true;
-      health.hadRtcUnavailable = true;
-      health.lastFailureReason = detail.reason || "decode-failures";
       rtcFallbackDeadline = 0;
       clearTimeout(rtcFallbackTimer);
+      activateRtcFallback(detail.reason || "decode-failures");
+    } else if (decodeStalled) {
+      health.lastFailureReason = detail.reason || "decode-stall";
+      scheduleRtcFallback();
     } else if (["closed", "channel-error"].includes(detail.reason)) {
       if (previousChannelState === "open") {
         health.disconnectCount = (Number(health.disconnectCount) || 0) + 1;
       }
       health.lastFailureReason = detail.reason;
       rtcFallbackRequiresReconnect = true;
-      rtcCommand("retry");
-      scheduleRtcFallback();
+      if (!passiveDiagnosticMode) {
+        rtcCommand("retry");
+        scheduleRtcFallback();
+      }
     } else if (detail.channelState === "open") {
       if (!Number.isFinite(health.rtcOpenedAtMs)) {
         health.rtcOpenedAtMs = elapsedMs();
@@ -658,20 +838,47 @@
     notifyBackground("meeting-transcriber:exported", { signature });
   }
 
-  function exportJson() {
+  function diagnosticTimestamp() {
+    return new Date().toISOString().replace(/[:.]/g, "-");
+  }
+
+  function exportDiagnostic() {
     scanChat();
     scanParticipants();
-    refreshCaptureHealth();
-    downloadJsonExport(Model.exportState(state));
+    const health = refreshCaptureHealth();
+    const exported = Model.exportState(state);
+    const diagnostic = {
+      ...exported,
+      diagnosticSnapshot: {
+        generatedAt: new Date().toISOString(),
+        extensionVersion: globalThis.chrome?.runtime?.getManifest?.().version || "",
+        browserLanguage: String(globalThis.navigator?.language || ""),
+        documentLanguage: String(document.documentElement?.lang || ""),
+        viewport: {
+          width: Math.max(0, Math.round(window.innerWidth || 0)),
+          height: Math.max(0, Math.round(window.innerHeight || 0)),
+        },
+        captionControl: health.captionControlDiagnostic || null,
+        passiveDiagnosticMode,
+        rtcObserverOnly: Boolean(rtcStatus.observerOnly),
+        observedDataChannels: health.observedDataChannels,
+      },
+    };
+    download(
+      `meeting-transcriber-diagnostic-${meetingCode}-${diagnosticTimestamp()}.json`,
+      `${JSON.stringify(diagnostic, null, 2)}\n`,
+      "application/json"
+    );
   }
 
   function autoExportJson() {
-    if (!autoExportEnabled || !state) return false;
+    if (passiveSession || passiveDiagnosticMode
+        || !autoExportEnabled || !state) return false;
     scanChat();
     scanParticipants();
     refreshCaptureHealth();
     const exported = Model.exportState(state);
-    if (!exported.entries.length) return false;
+    if (!AutoExport.shouldExport(exported)) return false;
     const signature = AutoExport.signature(exported);
     if (signature === lastExportSignature) return false;
     // Flush the latest in-memory captions immediately so the background
@@ -780,12 +987,12 @@
     if (!root) return;
     root.dataset.status = paused ? "paused" : status;
     const labels = {
-      waiting: "Увімкніть CC",
+      waiting: "Підключаю RTC…",
       connecting: "Підключаю RTC…",
-      enabling: "Вмикаю CC…",
       capturing: "Запис captions",
       "capturing-rtc": "Запис RTC captions",
       "rtc-unavailable": "RTC недоступний",
+      passive: "Пасивна діагностика",
       paused: "Пауза",
     };
     root.querySelector("[data-role=status]").textContent =
@@ -804,7 +1011,9 @@
     root.querySelector("[data-role=count]").textContent =
       `${visibleEntries.length} реплік`;
     const activity = root.querySelector("[data-role=activity]");
-    activity.textContent = paused
+    activity.textContent = passiveDiagnosticMode
+      ? "Лише спостереження"
+      : paused
       ? "Запис призупинено"
       : lastCaptionActivityEpoch
         ? `Оновлено ${new Date(lastCaptionActivityEpoch).toLocaleTimeString([], {
@@ -833,17 +1042,33 @@
       preview.append(row);
     });
     const rtcWarning = root.querySelector("[data-role=rtc-warning]");
-    rtcWarning.hidden = !rtcUnavailable;
+    rtcWarning.hidden = passiveDiagnosticMode || !rtcUnavailable;
+    root.querySelector('[data-action="passive-mode"]').checked =
+      passiveDiagnosticMode;
+    root.querySelector("[data-role=mode-reload-notice]").hidden =
+      passiveSession === passiveDiagnosticMode;
+    root.querySelector("[data-role=passive-notice]").hidden =
+      !passiveDiagnosticMode;
+    root.querySelector("[data-role=warning-title]").textContent =
+      "RTC captions не підключилися";
     const audioButton = root.querySelector('[data-action="audio-fallback"]');
     const audioMessage = root.querySelector("[data-role=audio-message]");
+    const autoAudioToggle = root.querySelector(
+      '[data-action="auto-audio-fallback"]'
+    );
+    autoAudioToggle.checked = autoAudioFallbackEnabled;
     if (audioFallbackRequestState === "pending") {
       audioButton.disabled = true;
       audioButton.textContent = "Запускаю…";
-      audioMessage.textContent = "Надсилаю команду локальному аудіомодулю.";
+      audioMessage.textContent = audioFallbackRequestedAutomatically
+        ? "RTC не працює — автоматично запускаю резервний аудіозапис."
+        : "Надсилаю команду локальному аудіомодулю.";
     } else if (audioFallbackRequestState === "sent") {
       audioButton.disabled = true;
       audioButton.textContent = "Запит надіслано";
-      audioMessage.textContent = "Підтвердьте режим запису у системному вікні.";
+      audioMessage.textContent = audioFallbackRequestedAutomatically
+        ? "Резервний аудіозапис запущено автоматично. Підтвердьте режим у системному вікні."
+        : "Підтвердьте режим запису у системному вікні.";
     } else if (audioFallbackRequestState === "failed") {
       audioButton.disabled = false;
       audioButton.textContent = "Спробувати ще раз";
@@ -856,7 +1081,9 @@
         "Щоб не втратити зустріч, увімкніть резервний запис звуку.";
     }
     setStatus(
-      rtcUnavailable
+      passiveDiagnosticMode
+        ? "passive"
+        : rtcUnavailable
         ? "rtc-unavailable"
         : rtcStatus.channelState === "open" || rtcStatus.decoded > 0
         ? "capturing-rtc"
@@ -871,20 +1098,34 @@
     root.dataset.status = "waiting";
     root.innerHTML = `
       <header>
-        <div><i></i><span data-role="status">Увімкніть CC</span></div>
+        <div><i></i><span data-role="status">Підключаю RTC…</span></div>
         <button data-action="collapse" title="Згорнути">−</button>
       </header>
       <section>
         <div class="mt-meta"><span data-role="count">0 реплік</span><span data-role="activity">Очікую на текст</span></div>
+        <label class="mt-mode-toggle">
+          <input type="checkbox" data-action="passive-mode">
+          <span>Пасивна діагностика</span>
+        </label>
+        <div class="mt-mode-reload" data-role="mode-reload-notice" hidden>
+          Режим змінено — перезавантажте вкладку Meet.
+        </div>
+        <div class="mt-passive" data-role="passive-notice" hidden>
+          Tactiq керує Meet. Розширення лише спостерігає; автоматичний export та аудіорезерв вимкнені.
+        </div>
         <div class="mt-warning" data-role="rtc-warning" hidden>
-          <strong>RTC captions не підключилися</strong>
+          <strong data-role="warning-title">RTC captions не підключилися</strong>
           <span data-role="audio-message">Щоб не втратити зустріч, увімкніть резервний запис звуку.</span>
           <button data-action="audio-fallback">Запустити аудіозапис</button>
+          <label class="mt-auto-audio">
+            <input type="checkbox" data-action="auto-audio-fallback" checked>
+            <span>Автоматично запускати аудіо при збої RTC</span>
+          </label>
         </div>
         <div class="mt-preview" data-role="preview"></div>
         <div class="mt-actions">
           <button data-action="pause">Пауза</button>
-          <button data-action="json">Зберегти зараз</button>
+          <button data-action="diagnostic">Діагностика</button>
         </div>
       </section>`;
     root.addEventListener("click", async (event) => {
@@ -913,27 +1154,28 @@
         event.target.textContent = paused ? "Продовжити" : "Пауза";
         render();
       }
-      if (action === "json") exportJson();
+      if (action === "diagnostic") exportDiagnostic();
       if (action === "audio-fallback") {
-        clearTimeout(audioFallbackResetTimer);
-        audioFallbackRequestState = "pending";
-        render();
-        try {
-          const response = await globalThis.chrome?.runtime?.sendMessage?.({
-            type: "meeting-transcriber:start-backup-audio",
-            meetingCode,
-          });
-          audioFallbackRequestState = response?.ok ? "sent" : "failed";
-        } catch {
-          audioFallbackRequestState = "failed";
-        }
-        render();
-        if (audioFallbackRequestState === "sent") {
-          audioFallbackResetTimer = setTimeout(() => {
-            audioFallbackRequestState = "idle";
-            render();
-          }, 30_000);
-        }
+        await requestAudioFallback();
+      }
+    });
+    root.addEventListener("change", async (event) => {
+      const action = event.target?.dataset.action;
+      if (action === "passive-mode") {
+        event.target.disabled = true;
+        const stored = await storageGet([SETTINGS_KEY]);
+        await storageSet({
+          [SETTINGS_KEY]: {
+            ...(stored[SETTINGS_KEY] || {}),
+            passiveDiagnosticMode: Boolean(event.target.checked),
+          },
+        });
+        event.target.disabled = false;
+        return;
+      }
+      if (action === "auto-audio-fallback") {
+        autoAudioFallbackEnabled = Boolean(event.target.checked);
+        scheduleSettingsSave();
       }
     });
     document.body.append(root);
@@ -948,14 +1190,16 @@
     await pruneOldMeetingStates();
     document.addEventListener(RTC_EVENT_NAME, handleRtcEvent);
     rtcCommand("bind");
-    notifyBackground("meeting-transcriber:register");
+    notifyBackground("meeting-transcriber:register", {
+      passiveDiagnosticMode: passiveSession,
+    });
     mountWidget();
     render();
     scanChat();
     scanParticipants();
-    rtcCommand("start");
+    rtcCommand(passiveDiagnosticMode ? "observe" : "start");
     rtcCommand("status");
-    scheduleRtcFallback();
+    if (!passiveDiagnosticMode) scheduleRtcFallback();
     setInterval(() => {
       scanChat();
       scanParticipants();
@@ -966,6 +1210,21 @@
     if (event.isTrusted && AutoExport.findLeaveControl(event.target)) autoExportJson();
   }, true);
   window.addEventListener("pagehide", autoExportJson);
+
+  globalThis.chrome?.storage?.onChanged?.addListener((changes, areaName) => {
+    if (areaName !== "local" || !changes[SETTINGS_KEY]) return;
+    const enabled = changes[SETTINGS_KEY].newValue?.passiveDiagnosticMode === true;
+    if (enabled === passiveDiagnosticMode) return;
+    passiveDiagnosticMode = enabled;
+    clearTimeout(rtcFallbackTimer);
+    rtcFallbackDeadline = 0;
+    rtcUnavailable = false;
+    rtcCommand(enabled ? "observe" : "start");
+    if (!enabled) {
+      scheduleRtcFallback();
+    }
+    render();
+  });
 
   initialize().catch((error) => {
     console.error("Meeting Transcriber initialization failed", error);

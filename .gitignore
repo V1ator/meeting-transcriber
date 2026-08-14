@@ -31,6 +31,7 @@ __pycache__/
 .record.pid
 .record.process.lock
 .control/
+.state/
 .record.toggle.lock/
 .DS_Store
 

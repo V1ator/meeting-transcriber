@@ -143,7 +143,7 @@ def assess_meet_capture(
             "rtc_disconnects",
             f"RTC-канал перепідключався: {disconnects}.",
         ))
-    if failures >= 3:
+    if failures:
         issues.append(_issue(
             "decode_failures",
             f"Зафіксовано помилки декодування RTC: {failures}.",
@@ -252,7 +252,9 @@ def assess_audio_capture(manifest: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def finalize_quality_report(session: str) -> dict[str, Any]:
+def finalize_quality_report(
+    session: str, *, summary_expected: bool = True
+) -> dict[str, Any]:
     """Combine capture and summary QA, persist it, and return it."""
     work_dir = project_paths.TRANSCRIPTS / session
     manifest = read_json(work_dir / "manifest.json", {}) or {}
@@ -265,7 +267,7 @@ def finalize_quality_report(session: str) -> dict[str, Any]:
         summary_quality = {}
 
     issues = list(capture.get("issues") or [])
-    if not summary_quality:
+    if summary_expected and not summary_quality:
         issues.append(_issue(
             "summary_quality_missing",
             "Не знайдено результат детермінованої перевірки summary.",

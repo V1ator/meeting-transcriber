@@ -57,6 +57,35 @@ class MeetingQualityTests(unittest.TestCase):
         self.assertEqual(report["status"], "review")
         self.assertEqual(report["status_label"], "Потребує перевірки")
 
+    def test_diagnostic_capture_does_not_require_summary_quality(self):
+        with tempfile.TemporaryDirectory() as directory:
+            transcripts = Path(directory)
+            session = "diagnostic"
+            work = transcripts / session
+            work.mkdir()
+            capture = meeting_quality.assess_meet_capture(
+                {
+                    "captureHealth": {
+                        "rtcPackets": 1,
+                        "decodeFailures": 1,
+                        "hadRtcUnavailable": True,
+                    }
+                },
+                [],
+            )
+            (work / "manifest.json").write_text(
+                json.dumps({"capture_quality": capture}), encoding="utf-8"
+            )
+            with mock.patch.object(
+                meeting_quality.project_paths, "TRANSCRIPTS", transcripts
+            ):
+                report = meeting_quality.finalize_quality_report(
+                    session, summary_expected=False
+                )
+            codes = {item["code"] for item in report["issues"]}
+            self.assertIn("decode_failures", codes)
+            self.assertNotIn("summary_quality_missing", codes)
+
     def test_final_report_combines_capture_and_summary_qa(self):
         with tempfile.TemporaryDirectory() as directory:
             transcripts = Path(directory)

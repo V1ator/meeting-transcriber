@@ -48,6 +48,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       [tabKey(tabId)]: {
         meetingCode: message.meetingCode,
         storageKey: message.storageKey,
+        passiveDiagnosticMode: message.passiveDiagnosticMode === true,
         lastExportSignature: "",
       },
     });
@@ -78,16 +79,19 @@ async function exportClosedTab(tabId) {
   const registration = registered[key];
   await chrome.storage.session.remove(key);
   if (!registration) return;
+  if (registration.passiveDiagnosticMode === true) return;
 
   const stored = await chrome.storage.local.get([
     registration.storageKey,
     SETTINGS_KEY,
   ]);
+  if (stored[SETTINGS_KEY]?.passiveDiagnosticMode === true) return;
   if (stored[SETTINGS_KEY]?.autoExportEnabled === false) return;
 
   const state = stored[registration.storageKey];
-  if (!state?.entries?.length) return;
+  if (!state) return;
   const exported = MeetingCaptionModel.exportState(state);
+  if (!MeetingAutoExport.shouldExport(exported)) return;
   const signature = MeetingAutoExport.signature(exported);
   if (signature === registration.lastExportSignature) return;
 

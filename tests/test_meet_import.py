@@ -51,7 +51,140 @@ def sample_export() -> dict:
     }
 
 
+def diagnostic_export() -> dict:
+    data = sample_export()
+    data["entries"] = []
+    data["diagnosticOnly"] = True
+    data["captureHealth"] = {
+        "channelState": "open",
+        "rtcPackets": 1,
+        "decodedCaptions": 0,
+        "decodeFailures": 1,
+        "hadRtcUnavailable": True,
+        "lastFailureReason": "decode-stall",
+        "unparsedPacketSample": {
+            "schemaVersion": 1,
+            "byteLength": 42,
+            "parsedAsProtobuf": True,
+            "fields": [{"field": 1, "wire": 2, "kind": "message"}],
+            "redacted": True,
+        },
+    }
+    return data
+
+
 class MeetImportTests(unittest.TestCase):
+    def test_diagnostic_export_without_captions_is_imported(self):
+        data = meet_import.validate_export(diagnostic_export())
+        self.assertTrue(meet_import.is_diagnostic_export(data))
+        self.assertEqual(meet_import.normalized_entries(data), [])
+        rendered = meet_import.render_markdown(data, [])
+        self.assertIn("Репліки не отримано", rendered)
+        self.assertIn("decode-stall", rendered)
+
+    def test_diagnostic_import_uses_failure_note_without_llm(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcripts = root / "transcripts"
+            recordings = root / "recordings"
+            notes = root / "notes"
+            source = root / "meet-abc-defg-hij-diagnostic.json"
+            source.write_text(
+                json.dumps(diagnostic_export()), encoding="utf-8"
+            )
+            session = meet_import.session_id(diagnostic_export())
+            note = notes / f"{session} — Транскрипт не отримано.md"
+            pipeline = mock.Mock()
+            pipeline.manifest_path.return_value = recordings / f"{session}.json"
+            pipeline.create_meet_capture_failure_note.return_value = note
+            with mock.patch.object(
+                    meet_import.project_paths, "TRANSCRIPTS", transcripts
+                ), mock.patch.object(
+                    meet_import.project_paths, "RECORDINGS", recordings
+                ), mock.patch.object(
+                    meet_import, "_session_pipeline_module", return_value=pipeline
+                ):
+                result = meet_import.import_export(source)
+            self.assertEqual(result, note)
+            pipeline.create_meet_capture_failure_note.assert_called_once()
+            pipeline.create_note_from_transcript.assert_not_called()
+            manifest = json.loads(
+                (recordings / f"{session}.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["status"], "complete")
+            self.assertTrue(manifest["capture_failed"])
+
+    def test_successful_meet_retry_removes_stale_error_log(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcripts = root / "transcripts"
+            recordings = root / "recordings"
+            notes = root / "notes"
+            failed = root / "failed"
+            for path in (transcripts, recordings, notes, failed):
+                path.mkdir()
+            session = "2026-08-12_13-00-42_meet-abc-defg-hij"
+            (transcripts / f"{session}.md").write_text(
+                "# Транскрипт\n", encoding="utf-8"
+            )
+            pipeline_utils.atomic_write_json(
+                recordings / f"{session}.json",
+                {
+                    "session": session,
+                    "source": "google-meet-live-captions",
+                    "status": "processing_failed",
+                    "processing_attempts": 1,
+                },
+            )
+            stale_error = failed / f"{session}.log"
+            stale_error.write_text("old error", encoding="utf-8")
+            note = notes / f"{session} — Готово.md"
+            with mock.patch.object(meet.project_paths, "TRANSCRIPTS", transcripts), \
+                    mock.patch.object(meet.project_paths, "RECORDINGS", recordings), \
+                    mock.patch.object(meet.project_paths, "NOTES", notes), \
+                    mock.patch.object(meet.project_paths, "FAILED", failed), \
+                    mock.patch.object(
+                        meet, "create_note_from_transcript", return_value=note
+                    ):
+                self.assertEqual(meet.retry_meet_session(session), note)
+            self.assertFalse(stale_error.exists())
+            manifest = json.loads(
+                (recordings / f"{session}.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["status"], "complete")
+
+    def test_completed_meet_is_not_reclassified_after_retry_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcripts = root / "transcripts"
+            recordings = root / "recordings"
+            notes = root / "notes"
+            for path in (transcripts, recordings, notes):
+                path.mkdir()
+            session = "2026-08-12_13-00-42_meet-abc-defg-hij"
+            (transcripts / f"{session}.md").write_text(
+                "# Транскрипт\n", encoding="utf-8"
+            )
+            manifest_path = recordings / f"{session}.json"
+            pipeline_utils.atomic_write_json(
+                manifest_path,
+                {
+                    "session": session,
+                    "source": "google-meet-live-captions",
+                    "status": "complete",
+                    "stage": "complete",
+                    "processing_attempts": meet.MAX_AUTO_RETRIES + 1,
+                },
+            )
+            with mock.patch.object(meet, "MEET_AUTO_SUMMARY", True), \
+                    mock.patch.object(meet.project_paths, "TRANSCRIPTS", transcripts), \
+                    mock.patch.object(meet.project_paths, "RECORDINGS", recordings), \
+                    mock.patch.object(meet.project_paths, "NOTES", notes):
+                self.assertEqual(meet.find_ready_meet_sessions(), [])
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["status"], "complete")
+            self.assertEqual(manifest["stage"], "complete")
+
     def test_rejects_oversized_normalized_text(self):
         data = sample_export()
         data["entries"] = [{
@@ -503,6 +636,58 @@ class MeetImportTests(unittest.TestCase):
                 (recordings / f"{expected_session}.json").read_text()
             )
             self.assertEqual(manifest["status"], "complete")
+
+    def test_watcher_turns_empty_diagnostic_export_into_failure_note(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            downloads = root / "Downloads"
+            transcripts = root / "transcripts"
+            recordings = root / "recordings"
+            notes = root / "notes"
+            failed = root / "failed"
+            downloads.mkdir()
+            source = downloads / "meet-abc-defg-hij-diagnostic.json"
+            source.write_text(
+                json.dumps(diagnostic_export()), encoding="utf-8"
+            )
+            os.utime(source, (900, 900))
+            expected_session = meet_import.session_id(diagnostic_export())
+            note = notes / f"{expected_session} — Транскрипт не отримано.md"
+
+            def create_failure_note(session: str, transcript: str) -> Path:
+                self.assertEqual(session, expected_session)
+                self.assertIn("Репліки не отримано", transcript)
+                note.parent.mkdir(parents=True, exist_ok=True)
+                note.write_text("# Транскрипт не отримано\n", encoding="utf-8")
+                return note
+
+            with (
+                mock.patch.object(meet, "MEET_AUTO_IMPORT", True),
+                mock.patch.object(meet, "MEET_AUTO_SUMMARY", True),
+                mock.patch.object(meet, "MEET_IMPORT_EXISTING", True),
+                mock.patch.object(meet, "MEET_DOWNLOADS_DIR", downloads),
+                mock.patch.object(meet, "MEET_IMPORT_STABLE_SECONDS", 5),
+                mock.patch.object(meet.project_paths, "TRANSCRIPTS", transcripts),
+                mock.patch.object(meet.project_paths, "RECORDINGS", recordings),
+                mock.patch.object(meet.project_paths, "NOTES", notes),
+                mock.patch.object(meet.project_paths, "FAILED", failed),
+                mock.patch.object(meet_import.project_paths, "TRANSCRIPTS", transcripts),
+                mock.patch.object(
+                    meet, "create_meet_capture_failure_note",
+                    side_effect=create_failure_note,
+                ) as failure_builder,
+                mock.patch.object(meet, "create_note_from_transcript") as note_builder,
+            ):
+                self.assertEqual(meet.process_meet_exports(now=1_000), 1)
+
+            failure_builder.assert_called_once()
+            note_builder.assert_not_called()
+            self.assertFalse(source.exists())
+            manifest = json.loads(
+                (recordings / f"{expected_session}.json").read_text()
+            )
+            self.assertEqual(manifest["status"], "complete")
+            self.assertTrue(manifest["capture_failed"])
 
     def test_failed_meet_note_retries_without_download_export(self):
         with tempfile.TemporaryDirectory() as directory:

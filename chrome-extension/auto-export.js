@@ -47,19 +47,36 @@
       meetingTitle: exported?.meetingTitle || "",
       participants: exported?.participants || [],
       entries: exported?.entries || [],
+      diagnosticOnly: Boolean(exported?.diagnosticOnly),
       captureHealth: {
         rtcOpenedAtMs: health.rtcOpenedAtMs || 0,
         firstCaptionMs: health.firstCaptionMs || 0,
         lastCaptionMs: health.lastCaptionMs || 0,
         decodedCaptions: health.decodedCaptions || 0,
         decodeFailures: health.decodeFailures || 0,
+        rtcPackets: health.rtcPackets || 0,
         disconnectCount: health.disconnectCount || 0,
         hadRtcUnavailable: Boolean(health.hadRtcUnavailable),
         recovered: Boolean(health.recovered),
         lastFailureReason: health.lastFailureReason || "",
         channelState: health.channelState || "",
+        unparsedPacketSample: health.unparsedPacketSample || null,
       },
     });
+  }
+
+  function isDiagnosticOnly(exported) {
+    const health = exported?.captureHealth || {};
+    return !(exported?.entries || []).length
+      && Boolean(exported?.diagnosticOnly)
+      && (
+        Number(health.decodeFailures) > 0
+        || Boolean(health.hadRtcUnavailable)
+      );
+  }
+
+  function shouldExport(exported) {
+    return Boolean((exported?.entries || []).length) || isDiagnosticOnly(exported);
   }
 
   function filename(exported) {
@@ -70,5 +87,13 @@
     return `meet-${code}-${timestamp}.json`;
   }
 
-  return { filename, findLeaveControl, isLeaveCallLabel, normalize, signature };
+  return {
+    filename,
+    findLeaveControl,
+    isDiagnosticOnly,
+    isLeaveCallLabel,
+    normalize,
+    shouldExport,
+    signature,
+  };
 });

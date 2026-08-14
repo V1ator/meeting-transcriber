@@ -84,17 +84,34 @@ CRITICAL_EVIDENCE_REASONING_PROMPT = (
 CLOSING_EVIDENCE_PROMPT = (
     PROMPTS / "meeting-evidence-closing.md"
 ).read_text(encoding="utf-8")
+SUMMARY_CACHE_SCHEMA_VERSION = 10
+STAGE_PROMPT_FINGERPRINTS = {
+    "context_extract": hashlib.sha256(
+        f"{SUMMARY_SYSTEM}\0{CONTEXT_EVIDENCE_PROMPT}".encode("utf-8")
+    ).hexdigest(),
+    "critical_extract": hashlib.sha256(
+        f"{SUMMARY_SYSTEM}\0{CRITICAL_EVIDENCE_PROMPT}".encode("utf-8")
+    ).hexdigest(),
+    "context_merge": hashlib.sha256(
+        f"{SUMMARY_SYSTEM}\0{CONTEXT_EVIDENCE_MERGE_PROMPT}".encode("utf-8")
+    ).hexdigest(),
+    "critical_merge": hashlib.sha256(
+        f"{SUMMARY_SYSTEM}\0{CRITICAL_EVIDENCE_MERGE_PROMPT}".encode("utf-8")
+    ).hexdigest(),
+    "critical_reconcile": hashlib.sha256(
+        f"{SUMMARY_SYSTEM}\0{CRITICAL_EVIDENCE_RECONCILE_PROMPT}".encode("utf-8")
+    ).hexdigest(),
+    "critical_reasoning": hashlib.sha256(
+        f"{SUMMARY_SYSTEM}\0{CRITICAL_EVIDENCE_REASONING_PROMPT}".encode("utf-8")
+    ).hexdigest(),
+    "closing_extract": hashlib.sha256(
+        f"{SUMMARY_SYSTEM}\0{CLOSING_EVIDENCE_PROMPT}".encode("utf-8")
+    ).hexdigest(),
+}
 PROMPT_FINGERPRINT = hashlib.sha256(
-    "\0".join((
-        SUMMARY_SYSTEM,
-        CONTEXT_EVIDENCE_PROMPT,
-        CRITICAL_EVIDENCE_PROMPT,
-        CONTEXT_EVIDENCE_MERGE_PROMPT,
-        CRITICAL_EVIDENCE_MERGE_PROMPT,
-        CRITICAL_EVIDENCE_RECONCILE_PROMPT,
-        CRITICAL_EVIDENCE_REASONING_PROMPT,
-        CLOSING_EVIDENCE_PROMPT,
-    )).encode("utf-8")
+    json.dumps(
+        STAGE_PROMPT_FINGERPRINTS, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
 ).hexdigest()
 
 TITLE_PROMPT = """Дай коротку назву summary: 3-6 українських слів по суті.
@@ -184,6 +201,26 @@ def log(message: str) -> None:
 
 def _sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _stage_cache_key(prompt: str, payload: str = "") -> str:
+    """Invalidate only the model stage whose effective prompt changed."""
+    return _sha256_text(f"{prompt}\0{payload}")
+
+
+def _summary_cache_meta(transcript: str, meeting_type: str) -> dict[str, Any]:
+    return {
+        "schema_version": SUMMARY_CACHE_SCHEMA_VERSION,
+        "prompt_fingerprint": PROMPT_FINGERPRINT,
+        "stage_prompt_fingerprints": STAGE_PROMPT_FINGERPRINTS,
+        "meeting_template_version": meeting_templates.TEMPLATE_VERSION,
+        "meeting_type": meeting_type,
+        "model": OLLAMA_MODEL,
+        "num_ctx": OLLAMA_NUM_CTX,
+        "extract_think": SUMMARY_EXTRACT_THINK,
+        "reconcile_think": SUMMARY_RECONCILE_THINK,
+        "transcript_sha256": _sha256_text(transcript),
+    }
 
 
 def _assert_private_ollama() -> None:
@@ -327,7 +364,30 @@ FIRST_PERSON_COMMITMENT_PATTERN = re.compile(
     r"(?:^|\b)(?:(?:я|так|да)\s+(?:вам\s+|тобі\s+|це\s+)?)?"
     r"(?:зроблю|підготую|надішлю|скину|передам|перевірю|додам|заповню|"
     r"створю|розішлю|проконтролюю|візьму|поговорю|напишу|оформлю|"
-    r"продублюю|відправлю|закину|поставлю|спробую|постараюся|постараюсь)\b"
+    r"продублюю|відправлю|закину|поставлю|підключу|домовлюся|"
+    r"зробимо|підготуємо|надішлемо|скинемо|передамо|перевіримо|додамо|"
+    r"заповнимо|створимо|розішлемо|проконтролюємо|візьмемо|поговоримо|"
+    r"напишемо|оформимо|продублюємо|відправимо|закинемо|поставимо|"
+    r"підключимо|домовимося|синхронізуємося|проведемо|організуємо|"
+    r"спробую|спробуємо|постараюся|постараюсь|постараємося)\b"
+)
+OWNER_ACCEPTANCE_PATTERN = re.compile(
+    r"(?:^|\b)(?:прийнято|погоджуюся|погоджуюсь|беру|окей|добре)\b"
+)
+COMPLETED_ACTION_CUE_PATTERN = re.compile(
+    r"\b(?:вже\s+)?(?:зробив|зробила|зробили|надіслав|надіслала|надіслали|"
+    r"відправив|відправила|відправили|скинув|скинула|скинули|закинув|"
+    r"закинула|закинули|передав|передала|передали|заповнив|заповнила|"
+    r"заповнили|створив|створила|створили|додав|додала|додали)\b"
+)
+GENERIC_HELP_OFFER_CLAIM_PATTERN = re.compile(
+    r"\b(?:залишатися|бути)\s+на\s+зв\s*язку\b|"
+    r"\b(?:надавати\s+)?допомог\w*\s+(?:за\s+потреби|якщо\s+потрібно)\b|"
+    r"\bпідключатися\s+(?:за\s+потреби|якщо\s+потрібно)\b"
+)
+GENERIC_HELP_OFFER_QUOTE_PATTERN = re.compile(
+    r"\b(?:якщо|коли).{0,40}(?:потріб\w*|допомог\w*).{0,60}"
+    r"(?:підключай|кажи|звертай|не\s+соромся)\b"
 )
 
 
@@ -520,6 +580,29 @@ def _infer_commitment_owners(
     return owners
 
 
+def _owner_has_grounded_commitment(
+    owner: str, proof_contexts: list[tuple[str, str]]
+) -> bool:
+    normalized_owner = _normalized_evidence_text(owner)
+    for speaker, text in proof_contexts:
+        if _normalized_evidence_text(speaker) != normalized_owner:
+            continue
+        normalized_text = _normalized_evidence_text(text)
+        if (
+            FIRST_PERSON_COMMITMENT_PATTERN.search(normalized_text)
+            or OWNER_ACCEPTANCE_PATTERN.search(normalized_text)
+        ):
+            return True
+    return False
+
+
+def _normalized_deadline(deadline: str) -> tuple[str, bool]:
+    normalized = _normalized_evidence_text(deadline)
+    if re.search(r"\bсьогодні\s+(?:або\s+)?завтра\b", normalized):
+        return "сьогодні або завтра", True
+    return deadline, False
+
+
 def _validated_evidence_ledger(
     value: dict[str, Any], transcript: str
 ) -> tuple[dict[str, Any], int]:
@@ -624,20 +707,9 @@ def _validated_evidence_ledger(
             for owner in owners
             if str(owner).strip()
         ]
-        grounded_speakers = {
-            _normalized_evidence_text(speaker)
-            for speaker in evidence_speakers
-            if _normalized_evidence_text(speaker)
-        }
         owners = [
             owner for owner in raw_owners
-            if (
-                _normalized_evidence_text(owner) in grounded_speakers
-                or _normalized_evidence_text(owner)
-                in _normalized_evidence_text(
-                    " ".join(text for _, text in proof_contexts)
-                )
-            )
+            if _owner_has_grounded_commitment(owner, proof_contexts)
         ]
         owners = _infer_commitment_owners(
             item_type, claim, owners, proof_contexts
@@ -647,12 +719,14 @@ def _validated_evidence_ledger(
         ).strip()
         if deadline and _normalized_evidence_text(deadline) not in normalized_transcript:
             deadline = ""
+        deadline, deadline_ambiguous = _normalized_deadline(deadline)
         items.append({
             "type": item_type,
             "claim": claim,
             "speaker": " / ".join(dict.fromkeys(evidence_speakers)) or "—",
             "owners": owners,
             "deadline": deadline,
+            "deadline_ambiguous": deadline_ambiguous,
             "status": status,
             "commitment_strength": strength,
             "confidence": confidence,
@@ -742,13 +816,14 @@ def _reduce_evidence_ledgers(
 
     def merge(batch: list[dict[str, Any]]) -> dict[str, Any]:
         joined = json.dumps(batch, ensure_ascii=False)
-        key = _sha256_text(joined)
+        active_prompt = merge_prompt.format(ledgers=joined)
+        key = _stage_cache_key(active_prompt, joined)
         cached = merges.get(key)
         if isinstance(cached, dict):
             upgraded, _ = _validated_evidence_ledger(cached, transcript)
             return upgraded
         result = _generate_evidence_ledger(
-            merge_prompt.format(ledgers=joined),
+            active_prompt,
             transcript,
             stage=stage,
             think=False,
@@ -789,21 +864,19 @@ def _reconcile_critical_evidence(
     if not ledger.get("items"):
         return {"items": []}
     joined = json.dumps(ledger, ensure_ascii=False)
-    key = _sha256_text(joined)
-    reconciliations = cache.setdefault("critical_reconciliations", {})
-    cached = reconciliations.get(key)
-    if isinstance(cached, dict):
-        upgraded, _ = _validated_evidence_ledger(cached, transcript)
-        return upgraded
-
+    reasoning_prompt = CRITICAL_EVIDENCE_REASONING_PROMPT.format(ledger=joined)
+    reasoning_key = _stage_cache_key(
+        reasoning_prompt,
+        f"think={SUMMARY_RECONCILE_THINK}\0{joined}",
+    )
     briefs = cache.setdefault("critical_reconciliation_briefs", {})
-    brief = str(briefs.get(key, "")).strip()
+    brief = str(briefs.get(reasoning_key, "")).strip()
     if not brief:
         if SUMMARY_RECONCILE_THINK:
             log("  evidence — reasoning-аналіз суперечностей")
             try:
                 brief = ollama_generate(
-                    CRITICAL_EVIDENCE_REASONING_PROMPT.format(ledger=joined),
+                    reasoning_prompt,
                     num_predict=6144,
                     think=True,
                     json_mode=False,
@@ -816,24 +889,32 @@ def _reconcile_critical_evidence(
                 brief = f"Reasoning недоступний: {exc}"
         else:
             brief = "Reasoning вимкнено; узгодь chronology без окремого аналізу."
-        briefs[key] = brief
+        briefs[reasoning_key] = brief
         atomic_write_json(cache_path, cache, mode=0o600)
     else:
         log("  evidence — reasoning-аналіз, кеш")
 
+    reconcile_prompt = CRITICAL_EVIDENCE_RECONCILE_PROMPT.format(
+        ledger=joined,
+        reasoning=brief,
+    )
+    reconcile_key = _stage_cache_key(reconcile_prompt, joined)
+    reconciliations = cache.setdefault("critical_reconciliations", {})
+    cached = reconciliations.get(reconcile_key)
+    if isinstance(cached, dict):
+        upgraded, _ = _validated_evidence_ledger(cached, transcript)
+        return upgraded
+
     log("  evidence — формування узгодженого JSON без reasoning")
     result = _generate_evidence_ledger(
-        CRITICAL_EVIDENCE_RECONCILE_PROMPT.format(
-            ledger=joined,
-            reasoning=brief,
-        ),
+        reconcile_prompt,
         transcript,
         stage="evidence — узгодження рішень",
         think=False,
         num_predict=SUMMARY_CRITICAL_RECONCILE_NUM_PREDICT,
         allowed_types=CRITICAL_EVIDENCE_TYPES,
     )
-    reconciliations[key] = result
+    reconciliations[reconcile_key] = result
     atomic_write_json(cache_path, cache, mode=0o600)
     return result
 
@@ -986,11 +1067,17 @@ def _deduplicate_evidence_items(
 
 
 STRONG_DECISION_CUE_PATTERN = re.compile(
-    r"\b(?:домовил\w*|виріш\w*|підсум\w*|залишаємо|залишимо|робимо|"
-    r"рухаємось|рухатись\s+таким\s+чином|остаточн\w*|фінальн\w*)\b"
+    r"\b(?:підсумок|підсумували|залишаємо|залишимо|робимо|рухаємось|"
+    r"рухатись\s+таким\s+чином|остаточн(?:е|ий|а)\s+рішення|"
+    r"фінальн(?:е|ий|а)\s+рішення)\b"
 )
-OPERATIONAL_FUTURE_CUE_PATTERN = re.compile(
-    r"\b(?:буде|будемо|будуть|плануємо|планувати)\b"
+EXPLICIT_ACCEPTANCE_CUE_PATTERN = re.compile(
+    r"\b(?:погоджуюся|погоджуюсь|погодили|погоджено|прийнято|"
+    r"згоден|згодна|згодні|підтверджую|так\s+і\s+робимо|окей\s+так|"
+    r"домовились|домовилися|домовлено|вирішили|вирішено)\b"
+)
+CONDITIONAL_CUE_PATTERN = re.compile(
+    r"\b(?:якщо|у\s+разі|за\s+умови|залежно\s+від|після\s+перевірки)\b"
 )
 PROPOSAL_CUE_PATTERN = re.compile(
     r"\b(?:давайте|можна|варто|краще|пропоную|пропонуємо|рекомендую|"
@@ -1003,31 +1090,42 @@ def _decision_has_explicit_acceptance(item: dict[str, Any]) -> bool:
         _normalized_evidence_text(str(proof.get("quote", "")))
         for proof in item.get("evidence", []) if isinstance(proof, dict)
     ]
-    if any(
-        STRONG_DECISION_CUE_PATTERN.search(quote)
-        for quote in normalized_quotes
-    ):
+    if any(EXPLICIT_ACCEPTANCE_CUE_PATTERN.search(quote) for quote in normalized_quotes):
+        return True
+    if any(CONDITIONAL_CUE_PATTERN.search(quote) for quote in normalized_quotes):
+        return False
+    if any(STRONG_DECISION_CUE_PATTERN.search(quote) for quote in normalized_quotes):
         return True
     contains_proposal = any(
         PROPOSAL_CUE_PATTERN.search(quote) for quote in normalized_quotes
     )
     if contains_proposal:
         return False
-    if any(
-        OPERATIONAL_FUTURE_CUE_PATTERN.search(quote)
-        for quote in normalized_quotes
-    ):
-        return True
-    speakers = {
-        str(proof.get("speaker", "")).casefold()
-        for proof in item.get("evidence", []) if isinstance(proof, dict)
-        and str(proof.get("speaker", "")).strip()
-    }
-    if len(speakers) < 2:
-        return False
+    return False
+
+
+def _item_has_completed_action_evidence(item: dict[str, Any]) -> bool:
     return any(
-        quote and not PROPOSAL_CUE_PATTERN.search(quote)
-        for quote in normalized_quotes
+        COMPLETED_ACTION_CUE_PATTERN.search(normalized_quote)
+        and not FIRST_PERSON_COMMITMENT_PATTERN.search(normalized_quote)
+        for proof in item.get("evidence", []) if isinstance(proof, dict)
+        for normalized_quote in [
+            _normalized_evidence_text(str(proof.get("quote", "")))
+        ]
+    )
+
+
+def _is_generic_help_offer(item: dict[str, Any]) -> bool:
+    if item.get("type") != "commitment" or item.get("deadline"):
+        return False
+    claim = _normalized_evidence_text(str(item.get("claim", "")))
+    quotes = " ".join(
+        _normalized_evidence_text(str(proof.get("quote", "")))
+        for proof in item.get("evidence", []) if isinstance(proof, dict)
+    )
+    return bool(
+        GENERIC_HELP_OFFER_CLAIM_PATTERN.search(claim)
+        and GENERIC_HELP_OFFER_QUOTE_PATTERN.search(quotes)
     )
 
 
@@ -1038,6 +1136,12 @@ def _normalize_evidence_lifecycle(
     normalized: list[dict[str, Any]] = []
     for original in items:
         item = dict(original)
+        if _is_generic_help_offer(item):
+            continue
+        if item.get("type") == "commitment" and _item_has_completed_action_evidence(item):
+            item["type"] = "completed_action"
+            item["status"] = "completed"
+            item["commitment_strength"] = "not_applicable"
         if (
             item.get("type") == "decision"
             and item.get("status") == "active"
@@ -1045,6 +1149,13 @@ def _normalize_evidence_lifecycle(
         ):
             item["type"] = "proposal"
             item["status"] = "open"
+            if any(
+                CONDITIONAL_CUE_PATTERN.search(
+                    _normalized_evidence_text(str(proof.get("quote", "")))
+                )
+                for proof in item.get("evidence", []) if isinstance(proof, dict)
+            ):
+                item["lifecycle_reason"] = "conditional_decision"
         normalized.append(item)
     return normalized
 
@@ -1090,6 +1201,8 @@ def _summary_quality_report(ledger: dict[str, Any]) -> dict[str, Any]:
             warnings.append({"code": "missing_owner", "claim": claim})
         if item.get("evidence") and not _item_source_order(item):
             warnings.append({"code": "missing_source_anchor", "claim": claim})
+        if item.get("deadline_ambiguous"):
+            warnings.append({"code": "ambiguous_deadline", "claim": claim})
     for index, item in enumerate(items):
         if any(_items_are_duplicates(item, other) for other in items[index + 1:]):
             errors.append({
@@ -1142,6 +1255,117 @@ def _closing_transcript_excerpt(
     return excerpt if excerpt and len(excerpt) < len(transcript) else ""
 
 
+THEMATIC_EVIDENCE_TYPES = {
+    "fact", "participant_claim", "recommendation", "hypothesis", "proposal",
+}
+
+
+def _thematic_item_score(item: dict[str, Any]) -> tuple[int, int, int]:
+    type_score = {
+        "fact": 5,
+        "participant_claim": 4,
+        "recommendation": 3,
+        "proposal": 2,
+        "hypothesis": 1,
+    }
+    confidence_score = {"high": 3, "medium": 2, "low": 1}
+    return (
+        confidence_score.get(str(item.get("confidence", "")), 2),
+        type_score.get(str(item.get("type", "")), 0),
+        len(item.get("evidence", [])),
+    )
+
+
+def _select_thematic_items(
+    items: list[dict[str, Any]], *, limit: int = 7
+) -> list[dict[str, Any]]:
+    """Select salient theses across the whole timeline, not only its start."""
+    candidates = [
+        item for item in items
+        if item.get("type") in THEMATIC_EVIDENCE_TYPES
+        and item.get("status") != "superseded"
+        and str(item.get("claim", "")).strip()
+    ]
+    candidates = sorted(
+        candidates,
+        key=lambda item: (_item_source_order(item) or 10**9),
+    )
+    distinct: list[dict[str, Any]] = []
+    for candidate in candidates:
+        duplicate_index = next((
+            index for index, existing in enumerate(distinct)
+            if _items_are_duplicates(existing, candidate)
+            or _claim_similarity(
+                str(existing.get("claim", "")),
+                str(candidate.get("claim", "")),
+            ) >= 0.80
+        ), None)
+        if duplicate_index is None:
+            distinct.append(candidate)
+        elif _thematic_item_score(candidate) > _thematic_item_score(
+            distinct[duplicate_index]
+        ):
+            distinct[duplicate_index] = candidate
+    candidates = distinct
+    if len(candidates) <= limit:
+        return candidates
+
+    bucket_count = min(5, limit, len(candidates))
+    bucket_winners = (
+        [candidates[0]] if bucket_count == 1 else [
+            candidates[
+                round(index * (len(candidates) - 1) / (bucket_count - 1))
+            ]
+            for index in range(bucket_count)
+        ]
+    )
+
+    selected = list(bucket_winners)
+    ranked = sorted(candidates, key=_thematic_item_score, reverse=True)
+    for candidate in ranked:
+        if len(selected) >= limit:
+            break
+        if candidate in selected:
+            continue
+        if any(
+            _claim_similarity(
+                str(candidate.get("claim", "")), str(existing.get("claim", ""))
+            ) >= 0.72
+            for existing in selected
+        ):
+            continue
+        selected.append(candidate)
+    if len(selected) < limit:
+        selected.extend(
+            candidate for candidate in candidates
+            if candidate not in selected
+        )
+    return sorted(
+        selected[:limit],
+        key=lambda item: (_item_source_order(item) or 10**9),
+    )
+
+
+def _representative_topic_claims(
+    thematic_items: list[dict[str, Any]], *, limit: int = 3
+) -> list[str]:
+    if not thematic_items:
+        return []
+    indexes = [0]
+    if len(thematic_items) > 2:
+        indexes.append(len(thematic_items) // 2)
+    if len(thematic_items) > 1:
+        indexes.append(len(thematic_items) - 1)
+    claims: list[str] = []
+    for index in indexes:
+        claim = str(thematic_items[index].get("claim", "")).strip().rstrip(". ")
+        if claim and _normalized_evidence_text(claim) not in {
+            _normalized_evidence_text(existing) for existing in claims
+        }:
+            claims.append(claim)
+    return claims[:limit]
+
+
 def _render_grounded_sections(
     summary: str,
     ledger: dict[str, Any],
@@ -1157,7 +1381,12 @@ def _render_grounded_sections(
     seen_decisions: set[str] = set()
     seen_actions: set[str] = set()
     seen_questions: set[str] = set()
-    for item in ledger.get("items", []):
+    ledger_items = [
+        item for item in ledger.get("items", []) if isinstance(item, dict)
+    ]
+    thematic_items = _select_thematic_items(ledger_items)
+    thematic_ids = {id(item) for item in thematic_items}
+    for item in ledger_items:
         item_type = item.get("type")
         status = item.get("status")
         claim = str(item.get("claim", "")).strip()
@@ -1170,8 +1399,8 @@ def _render_grounded_sections(
                 "proposal",
             }
             and status != "superseded"
+            and id(item) in thematic_ids
             and key not in seen_theses
-            and len(theses) < 7
         ):
             prefix = {
                 "recommendation": "Рекомендація: ",
@@ -1190,13 +1419,7 @@ def _render_grounded_sections(
             )
             deadline = str(item.get("deadline", "")).strip()
             suffix = f" — дедлайн: {deadline}" if deadline else ""
-            action_claim = claim
-            if (
-                item.get("commitment_strength") == "soft"
-                and not re.match(r"(?i)^(спробувати|постаратися|планувати)\b", claim)
-            ):
-                action_claim = f"Спробувати {claim[:1].lower() + claim[1:]}"
-            actions.append(f"- [{owner_text}] {action_claim}{suffix}")
+            actions.append(f"- [{owner_text}] {claim}{suffix}")
             seen_actions.add(key)
         if (
             item_type == "open_question"
@@ -1205,21 +1428,24 @@ def _render_grounded_sections(
         ):
             questions.append(f"- {claim}")
             seen_questions.add(key)
-    topic_claims = [line.removeprefix("- ").rstrip(". ") for line in theses[:1]]
+        if (
+            item.get("lifecycle_reason") == "conditional_decision"
+            and key not in seen_questions
+        ):
+            question_claim = claim.rstrip(". ?")
+            questions.append(f"- Чи підтвердиться після перевірки: {question_claim}?")
+            seen_questions.add(key)
+    topic_claims = _representative_topic_claims(thematic_items)
     if not topic_claims:
         topic_claims = [
             line.removeprefix("- ").rstrip(". ")
-            for line in (decisions or actions)[:1]
+            for line in (decisions or actions)[:3]
         ]
     topic_text = "; ".join(topic_claims) if topic_claims else "зміст зустрічі"
     decision_claims = [
         line.removeprefix("- ").rstrip(". ") for line in decisions[:3]
     ]
-    clean_title = meeting_title.strip().rstrip(". ")
-    tldr = [
-        f"На зустрічі обговорили: {clean_title}."
-        if clean_title else f"На зустрічі обговорили: {topic_text}."
-    ]
+    tldr = [f"На зустрічі обговорили: {topic_text}."]
     if decision_claims:
         tldr.append(f"Явні рішення: {'; '.join(decision_claims)}.")
     else:
@@ -1271,17 +1497,7 @@ def summarize(session: str, transcript: str) -> str:
     meeting_type = meeting_templates.detect_meeting_type(
         meeting_title, transcript
     )
-    meta = {
-        "schema_version": 9,
-        "prompt_fingerprint": PROMPT_FINGERPRINT,
-        "meeting_template_version": meeting_templates.TEMPLATE_VERSION,
-        "meeting_type": meeting_type,
-        "model": OLLAMA_MODEL,
-        "num_ctx": OLLAMA_NUM_CTX,
-        "extract_think": SUMMARY_EXTRACT_THINK,
-        "reconcile_think": SUMMARY_RECONCILE_THINK,
-        "transcript_sha256": _sha256_text(transcript),
-    }
+    meta = _summary_cache_meta(transcript, meeting_type)
     cache = read_json(cache_path, {}) or {}
     if cache.get("_meta") != meta:
         previous_meta = cache.get("_meta", {})
@@ -1296,7 +1512,8 @@ def summarize(session: str, transcript: str) -> str:
             for name in (
                 "critical_parts", "context_parts",
                 "critical_merges", "context_merges",
-                "closing_parts",
+                "closing_parts", "critical_reconciliations",
+                "critical_reconciliation_briefs",
             ):
                 if isinstance(cache.get(name), dict):
                     reusable[name] = cache[name]
@@ -1337,41 +1554,44 @@ def summarize(session: str, transcript: str) -> str:
     critical_parts = cache.setdefault("critical_parts", {})
     context_parts = cache.setdefault("context_parts", {})
     for index, chunk in enumerate(chunks, start=1):
-        key = _sha256_text(chunk)
-        critical = critical_parts.get(key)
+        critical_prompt = CRITICAL_EVIDENCE_PROMPT.format(
+            chunk_index=index,
+            chunk_total=len(chunks),
+            transcript=chunk,
+        )
+        critical_key = _stage_cache_key(critical_prompt, chunk)
+        critical = critical_parts.get(critical_key)
         if isinstance(critical, dict):
             log(f"  evidence {index}/{len(chunks)} — рішення/дії, кеш")
             critical, _ = _validated_evidence_ledger(critical, transcript)
         else:
             log(f"  evidence {index}/{len(chunks)} — рішення/дії")
             critical = _generate_evidence_ledger(
-                CRITICAL_EVIDENCE_PROMPT.format(
-                    chunk_index=index,
-                    chunk_total=len(chunks),
-                    transcript=chunk,
-                ),
+                critical_prompt,
                 chunk,
                 stage=f"critical evidence {index}/{len(chunks)}",
                 think=SUMMARY_EXTRACT_THINK,
                 num_predict=4096,
                 allowed_types=CRITICAL_EVIDENCE_TYPES,
             )
-            critical_parts[key] = critical
+            critical_parts[critical_key] = critical
             atomic_write_json(cache_path, cache, mode=0o600)
         critical_ledgers.append(critical)
 
-        context = context_parts.get(key)
+        context_prompt = CONTEXT_EVIDENCE_PROMPT.format(
+            chunk_index=index,
+            chunk_total=len(chunks),
+            transcript=chunk,
+        )
+        context_key = _stage_cache_key(context_prompt, chunk)
+        context = context_parts.get(context_key)
         if isinstance(context, dict):
             log(f"  evidence {index}/{len(chunks)} — контекст, кеш")
             context, _ = _validated_evidence_ledger(context, transcript)
         else:
             log(f"  evidence {index}/{len(chunks)} — контекст")
             context = _generate_evidence_ledger(
-                CONTEXT_EVIDENCE_PROMPT.format(
-                    chunk_index=index,
-                    chunk_total=len(chunks),
-                    transcript=chunk,
-                ),
+                context_prompt,
                 chunk,
                 stage=f"context evidence {index}/{len(chunks)}",
                 think=SUMMARY_EXTRACT_THINK,
@@ -1379,14 +1599,17 @@ def summarize(session: str, transcript: str) -> str:
                 allowed_types=CONTEXT_EVIDENCE_TYPES,
                 repair_item_limit=SUMMARY_CONTEXT_REPAIR_ITEMS,
             )
-            context_parts[key] = context
+            context_parts[context_key] = context
             atomic_write_json(cache_path, cache, mode=0o600)
         context_ledgers.append(context)
 
     closing_excerpt = _closing_transcript_excerpt(transcript)
     if closing_excerpt:
         closing_parts = cache.setdefault("closing_parts", {})
-        closing_key = _sha256_text(closing_excerpt)
+        closing_prompt = CLOSING_EVIDENCE_PROMPT.format(
+            transcript=closing_excerpt
+        )
+        closing_key = _stage_cache_key(closing_prompt, closing_excerpt)
         closing = closing_parts.get(closing_key)
         if isinstance(closing, dict):
             log("  evidence — фінальний recap, кеш")
@@ -1394,7 +1617,7 @@ def summarize(session: str, transcript: str) -> str:
         else:
             log("  evidence — фінальний recap")
             closing = _generate_evidence_ledger(
-                CLOSING_EVIDENCE_PROMPT.format(transcript=closing_excerpt),
+                closing_prompt,
                 closing_excerpt,
                 stage="closing evidence",
                 think=SUMMARY_EXTRACT_THINK,

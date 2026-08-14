@@ -245,3 +245,17 @@ test("export includes a capture health snapshot", () => {
     exportedAt: "2026-08-12T10:30:00.000Z",
   });
 });
+
+test("failed empty RTC session becomes a diagnostic-only export", () => {
+  const current = state();
+  current.entries = [];
+  current.captureHealth = {
+    rtcPackets: 1,
+    decodeFailures: 1,
+    hadRtcUnavailable: true,
+    lastFailureReason: "decode-stall",
+  };
+  const exported = Model.exportState(current, "2026-08-12T10:30:00.000Z");
+  assert.equal(exported.diagnosticOnly, true);
+  assert.deepEqual(exported.entries, []);
+});

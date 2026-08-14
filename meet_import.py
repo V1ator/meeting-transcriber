@@ -346,6 +346,30 @@ def session_id(data: dict[str, Any]) -> str:
     return f"{started:%Y-%m-%d_%H-%M-%S}_meet-{_meeting_code(data.get('meetingCode'))}"
 
 
+def is_diagnostic_export(data: dict[str, Any]) -> bool:
+    """Accept an empty export only when it explicitly records an RTC failure."""
+    entries = data.get("entries")
+    health = data.get("captureHealth")
+    if not isinstance(health, dict):
+        return False
+    return (
+        data.get("diagnosticOnly") is True
+        and isinstance(entries, list)
+        and not entries
+        and (
+            _number(health.get("decodeFailures")) > 0
+            or bool(health.get("hadRtcUnavailable"))
+        )
+    )
+
+
+def _number(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def validate_export(data: Any) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise MeetImportError("Коренем JSON має бути object")
@@ -355,7 +379,9 @@ def validate_export(data: Any) -> dict[str, Any]:
         raise MeetImportError("Невідоме джерело транскрипту")
     _parse_datetime(data.get("startedAt"))
     entries = data.get("entries")
-    if not isinstance(entries, list) or not entries:
+    if not isinstance(entries, list):
+        raise MeetImportError("Транскрипт не містить реплік")
+    if not entries and not is_diagnostic_export(data):
         raise MeetImportError("Транскрипт не містить реплік")
     if len(entries) > MAX_ENTRIES:
         raise MeetImportError(f"Забагато реплік: {len(entries)}")
@@ -497,7 +523,7 @@ def normalized_entries(data: dict[str, Any]) -> list[dict[str, Any]]:
         result.append(item)
         if kind == "chat" or _long_text(text):
             seen_exact.add(exact_key)
-    if not result:
+    if not result and not is_diagnostic_export(data):
         raise MeetImportError("Після нормалізації не залишилося реплік")
     _check_deadline(deadline)
     return _assemble_turns(result, deadline=deadline)
@@ -537,6 +563,15 @@ def render_markdown(data: dict[str, Any], entries: list[dict[str, Any]]) -> str:
             speaker = f"{speaker} (chat)"
         lines.append(
             f"[{timestamp:%H:%M:%S}] {speaker}: {entry['text']}"
+        )
+    if not entries:
+        health = data.get("captureHealth") or {}
+        reason = _clean_inline(
+            health.get("lastFailureReason"), fallback="rtc-unavailable"
+        )
+        lines.append(
+            "— Репліки не отримано: RTC captions були недоступні "
+            f"({reason}). Див. capture-quality.json."
         )
     return "\n".join(lines) + "\n"
 
@@ -588,11 +623,17 @@ def import_export(path: Path, *, summarize: bool = True, force: bool = False) ->
         "source": "google-meet-live-captions",
         "created_at": utc_now(),
     }, mode=0o600)
-    note = session_pipeline.create_note_from_transcript(session, transcript)
+    if is_diagnostic_export(data):
+        note = session_pipeline.create_meet_capture_failure_note(
+            session, transcript
+        )
+    else:
+        note = session_pipeline.create_note_from_transcript(session, transcript)
     update_manifest(
         session_pipeline.manifest_path(session),
         status="complete",
         stage="complete",
+        capture_failed=is_diagnostic_export(data),
         note=str(note),
         completed_at=utc_now(),
     )

@@ -227,6 +227,22 @@
 
   function exportState(state, endedAt) {
     const exportedAt = endedAt || new Date().toISOString();
+    const entries = compactEntries(state.entries).map((entry) => ({
+      speaker: entry.speaker,
+      text: entry.text,
+      ...(entry.kind === "chat" ? { kind: "chat" } : {}),
+      startMs: Math.round(entry.startMs),
+      endMs: Math.round(entry.endMs),
+    }));
+    const captureHealth = {
+      ...(state.captureHealth && typeof state.captureHealth === "object"
+        ? state.captureHealth : {}),
+      exportedAt,
+    };
+    const diagnosticOnly = entries.length === 0 && (
+      Number(captureHealth.decodeFailures) > 0
+      || Boolean(captureHealth.hadRtcUnavailable)
+    );
     const participants = [];
     const participantState = { participants };
     (state.participants || []).forEach(
@@ -244,18 +260,9 @@
       participants,
       language: state.language,
       endedAt: exportedAt,
-      captureHealth: {
-        ...(state.captureHealth && typeof state.captureHealth === "object"
-          ? state.captureHealth : {}),
-        exportedAt,
-      },
-      entries: compactEntries(state.entries).map((entry) => ({
-        speaker: entry.speaker,
-        text: entry.text,
-        ...(entry.kind === "chat" ? { kind: "chat" } : {}),
-        startMs: Math.round(entry.startMs),
-        endMs: Math.round(entry.endMs),
-      })),
+      ...(diagnosticOnly ? { diagnosticOnly: true } : {}),
+      captureHealth,
+      entries,
     };
   }
 

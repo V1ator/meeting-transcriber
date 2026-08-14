@@ -33,6 +33,19 @@ _DIMENSION_HEADINGS = (
     "Рефлексія",
     "Усвідомлення упереджень",
 )
+_DIMENSION_EVIDENCE_NAMES = {
+    "Мотивація": {"motivation", "мотивація"},
+    "Релевантність досвіду": {
+        "experience relevance", "experience_relevance", "релевантність досвіду",
+    },
+    "Критичне мислення": {
+        "critical thinking", "critical_thinking", "критичне мислення",
+    },
+    "Рефлексія": {"reflection", "рефлексія"},
+    "Усвідомлення упереджень": {
+        "bias awareness", "bias_awareness", "усвідомлення упереджень",
+    },
+}
 
 
 def report_field(report: str, label: str) -> str:
@@ -144,6 +157,66 @@ def _evidence_records(evidence: str) -> dict[str, dict[str, str]]:
     return records
 
 
+def candidate_evidence_confidence_caps(evidence: str) -> dict[str, str]:
+    """Return deterministic maximum confidence supported by the full ledger."""
+    records = _evidence_records(evidence)
+    caps: dict[str, str] = {}
+    for heading, aliases in _DIMENSION_EVIDENCE_NAMES.items():
+        relevant = [
+            item for item in records.values()
+            if any(
+                alias in {
+                    value.strip()
+                    for value in item["dimensions"].replace(";", ",").split(",")
+                }
+                for alias in aliases
+            )
+        ]
+        if not relevant:
+            caps[heading] = "Низька"
+            continue
+        situations = {
+            item["situation"] for item in relevant if item["situation"]
+        }
+        has_strong_observation = any(
+            item["type"] in {"candidate_live", "corroborated"}
+            for item in relevant
+        )
+        caps[heading] = (
+            "Висока"
+            if len(situations) >= 3 and has_strong_observation
+            else "Середня"
+        )
+    return caps
+
+
+def candidate_report_confidence_caps(
+    report: str, evidence: str
+) -> dict[str, str]:
+    """Return confidence caps for the evidence IDs actually cited per section."""
+    records = _evidence_records(evidence)
+    caps: dict[str, str] = {}
+    for heading in _DIMENSION_HEADINGS:
+        cited = _cited_evidence_ids(_section(report, heading))
+        relevant = [records[value] for value in cited if value in records]
+        if not relevant:
+            caps[heading] = "Низька"
+            continue
+        situations = {
+            item["situation"] for item in relevant if item["situation"]
+        }
+        has_strong_observation = any(
+            item["type"] in {"candidate_live", "corroborated"}
+            for item in relevant
+        )
+        caps[heading] = (
+            "Висока"
+            if len(situations) >= 3 and has_strong_observation
+            else "Середня"
+        )
+    return caps
+
+
 def _normalized_quote(value: str) -> str:
     value = value.casefold().replace("…", " ")
     value = re.sub(r"\.{3,}", " ", value)
@@ -213,6 +286,20 @@ def validate_candidate_report(
     )
     if errors:
         return errors
+
+    evidence_id_pattern = r"E[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)+"
+    malformed_evidence_id = any(
+        match.start() == 0
+        or match.end() == len(report)
+        or report[match.start() - 1] != "["
+        or report[match.end()] != "]"
+        for match in re.finditer(evidence_id_pattern, report)
+    ) or bool(
+        re.search(rf"\[{evidence_id_pattern}\][A-Za-z0-9_-]+\]", report)
+        or re.search(r"\[E[A-Za-z][A-Za-z0-9_-]*\](?!\()", report)
+    )
+    if malformed_evidence_id:
+        errors.append("некоректно відформатовані evidence ID")
 
     decision_status = fields["Статус рішення"].casefold()
     final_recommendation = _normalized_choice(

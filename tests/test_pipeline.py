@@ -14,6 +14,7 @@ import mic_watch
 import record
 import transcribe
 import audio_pipeline as audio
+import meeting_quality
 import summary_pipeline as summary_pipeline_module
 import watch_and_process as watcher
 
@@ -476,6 +477,64 @@ class TranscriptionQualityTests(unittest.TestCase):
 
 
 class MeetingNoteMetadataTests(unittest.TestCase):
+    def test_diagnostic_meet_capture_creates_explicit_note_without_summary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcripts = root / "transcripts"
+            notes = root / "notes"
+            session = "2026-08-13_13-00-23_meet-nhp-mdhx-koc"
+            work = transcripts / session
+            work.mkdir(parents=True)
+            transcript = """# Meet - RT // OP
+
+- **Час початку:** 2026-08-13 13:00:23 CEST
+- **Назва зустрічі:** Meet - RT // OP
+
+**Учасники:**
+- Roman Tarnavskyi
+- Oleh Parandii
+
+## Транскрипт
+
+— Репліки не отримано.
+"""
+            capture = meeting_quality.assess_meet_capture(
+                {
+                    "captureHealth": {
+                        "rtcPackets": 1,
+                        "decodeFailures": 1,
+                        "hadRtcUnavailable": True,
+                        "lastFailureReason": "decode-stall",
+                    }
+                },
+                [],
+            )
+            pipeline_utils.atomic_write_json(
+                work / "manifest.json", {"capture_quality": capture}
+            )
+            pipeline_utils.atomic_write_json(
+                work / "meet-captions.json",
+                {
+                    "captureHealth": {
+                        "rtcPackets": 1,
+                        "decodeFailures": 1,
+                        "lastFailureReason": "decode-stall",
+                    }
+                },
+            )
+            with mock.patch.object(audio.project_paths, "TRANSCRIPTS", transcripts), \
+                    mock.patch.object(audio.project_paths, "NOTES", notes), \
+                    mock.patch.object(
+                        meeting_quality.project_paths, "TRANSCRIPTS", transcripts
+                    ), mock.patch.object(audio, "_index_meeting_note"):
+                note = audio.create_meet_capture_failure_note(session, transcript)
+            content = note.read_text(encoding="utf-8")
+            self.assertIn("# Транскрипт не отримано — Meet - RT // OP", content)
+            self.assertIn("RTC-пакетів: 1", content)
+            self.assertIn("Помилок декодування: 1", content)
+            self.assertNotIn("## TL;DR", content)
+            self.assertTrue((work / "quality-report.json").is_file())
+
     def test_uses_explicit_meet_metadata_and_all_participants(self):
         transcript = """# Weekly sync
 
@@ -1046,6 +1105,25 @@ class WatcherStateTests(unittest.TestCase):
         ledger, _ = summary_pipeline_module._validated_evidence_ledger(raw, transcript)
         self.assertEqual(ledger["items"][0]["owners"], ["Current User"])
 
+    def test_assigned_owner_requires_and_keeps_own_acceptance_quote(self):
+        transcript = "\n".join([
+            "[00:10] Oleh: Олесю, синхронізуйся з Наташею.",
+            "[00:11] Olesia: Окей.",
+        ])
+        raw = {"items": [{
+            "type": "commitment",
+            "claim": "Синхронізуватися з Наташею",
+            "owners": ["Olesia"],
+            "status": "open",
+            "commitment_strength": "explicit",
+            "evidence": [
+                {"timestamp": "00:10", "quote": "Олесю, синхронізуйся з Наташею"},
+                {"timestamp": "00:11", "quote": "Окей"},
+            ],
+        }]}
+        ledger, _ = summary_pipeline_module._validated_evidence_ledger(raw, transcript)
+        self.assertEqual(ledger["items"][0]["owners"], ["Olesia"])
+
     def test_unaccepted_advice_is_downgraded_from_decision(self):
         item = {
             "type": "decision",
@@ -1246,7 +1324,7 @@ class WatcherStateTests(unittest.TestCase):
         actions = summary_pipeline_module._summary_section(summary, "## Action items")
         self.assertEqual(decisions, "- Проводити щотижневий sync")
         self.assertIn("[Інтерв’юер] Проаналізувати конкурентів", actions)
-        self.assertIn("Спробувати організувати", actions)
+        self.assertIn("Організувати зустріч", actions)
         self.assertIn("дедлайн: наступного тижня", actions)
         self.assertNotIn("США", decisions)
         self.assertNotIn("Meta Ads Library", actions)
@@ -1281,6 +1359,160 @@ class WatcherStateTests(unittest.TestCase):
         self.assertNotIn("QR-коди", questions)
         self.assertEqual(questions, "- Чи буде інтернатура?")
         self.assertIn("[Власник не визначений]", actions)
+
+    def test_reviewed_bi_meeting_lifecycle_regression(self):
+        transcript = "\n".join([
+            "[10:53:52] Oleh Parandii: Треба синхронізуватися з Наташею.",
+            "[11:00:54] Olesia Khabliuk: Ми синхронізуємося з Наташею і Аліною.",
+            "[11:16:25] Olesia Khabliuk: Я вже закинула Кирилу, вони ще сьогодні скажуть.",
+            "[11:31:57] Olesia Khabliuk: Я сьогодні завтра закину опис. Якщо вплив моделі буде мінімальний, будемо йти від документації.",
+            "[11:33:02] Oleh Parandii: Якщо десь допомога потрібна, підключай, не соромся.",
+        ])
+        raw = {"items": [
+            {
+                "type": "commitment",
+                "claim": "Синхронізуватися з Наташею і Аліною",
+                "owners": [],
+                "deadline": "",
+                "status": "open",
+                "commitment_strength": "explicit",
+                "confidence": "high",
+                "evidence": [{
+                    "timestamp": "11:00:54",
+                    "quote": "Ми синхронізуємося з Наташею і Аліною",
+                }],
+            },
+            {
+                "type": "commitment",
+                "claim": "Надіслати матеріали Кирилу",
+                "owners": ["Olesia Khabliuk"],
+                "deadline": "",
+                "status": "open",
+                "commitment_strength": "explicit",
+                "confidence": "high",
+                "evidence": [{
+                    "timestamp": "11:16:25",
+                    "quote": "Я вже закинула Кирилу",
+                }],
+            },
+            {
+                "type": "commitment",
+                "claim": "Надіслати опис",
+                "owners": [],
+                "deadline": "сьогодні завтра",
+                "status": "open",
+                "commitment_strength": "explicit",
+                "confidence": "high",
+                "evidence": [{
+                    "timestamp": "11:31:57",
+                    "quote": "Я сьогодні завтра закину опис",
+                }],
+            },
+            {
+                "type": "decision",
+                "claim": "Працювати від документації, якщо вплив моделі мінімальний",
+                "owners": [],
+                "deadline": "",
+                "status": "active",
+                "commitment_strength": "not_applicable",
+                "confidence": "medium",
+                "evidence": [{
+                    "timestamp": "11:31:57",
+                    "quote": "Якщо вплив моделі буде мінімальний, будемо йти від документації",
+                }],
+            },
+            {
+                "type": "commitment",
+                "claim": "Залишатися на зв'язку і допомагати за потреби",
+                "owners": ["Oleh Parandii"],
+                "deadline": "",
+                "status": "open",
+                "commitment_strength": "soft",
+                "confidence": "medium",
+                "evidence": [{
+                    "timestamp": "11:33:02",
+                    "quote": "Якщо десь допомога потрібна, підключай, не соромся",
+                }],
+            },
+        ]}
+        ledger, dropped = summary_pipeline_module._validated_evidence_ledger(
+            raw, transcript
+        )
+        self.assertEqual(dropped, 0)
+        items = summary_pipeline_module._normalize_evidence_lifecycle(
+            ledger["items"]
+        )
+
+        sync = next(item for item in items if "Наташею" in item["claim"])
+        self.assertEqual(sync["owners"], ["Olesia Khabliuk"])
+        sent = next(item for item in items if "Кирилу" in item["claim"])
+        self.assertEqual((sent["type"], sent["status"]), ("completed_action", "completed"))
+        send_description = next(item for item in items if item["claim"] == "Надіслати опис")
+        self.assertEqual(send_description["deadline"], "сьогодні або завтра")
+        self.assertTrue(send_description["deadline_ambiguous"])
+        conditional = next(item for item in items if "документації" in item["claim"])
+        self.assertEqual((conditional["type"], conditional["status"]), ("proposal", "open"))
+        self.assertEqual(conditional["lifecycle_reason"], "conditional_decision")
+        self.assertFalse(any("зв'язку" in item["claim"] for item in items))
+
+    def test_thematic_summary_covers_late_topics_and_ignores_meet_title(self):
+        items = []
+        for index, claim in enumerate([
+            "BI має зібрати перелік пріоритетів",
+            "BI має зібрати перелік основних пріоритетів",
+            "HR-аналітика потребує уточнення метрик",
+            "Дашборд має показувати динаміку",
+            "Потрібно перевірити якість джерел",
+            "Команда обговорила доступи",
+            "Власники уточнюють строки",
+            "Регулярні процеси можуть лишатися за розкладом",
+            "Event Router використовують лише там, де він дає користь",
+        ], start=1):
+            items.append({
+                "type": "fact",
+                "status": "active",
+                "claim": claim,
+                "confidence": "high",
+                "source_order": index,
+                "evidence": [{"source_line": index, "quote": claim}],
+            })
+        summary = summary_pipeline_module._render_grounded_sections(
+            summary_pipeline_module.SUMMARY_TEMPLATE,
+            {"items": items},
+            meeting_title="Meet - OK // OP weekly",
+        )
+        theses = summary_pipeline_module._summary_section(summary, "## Основні тези")
+        tldr = summary_pipeline_module._summary_section(summary, "## TL;DR")
+        self.assertIn("Event Router", theses)
+        self.assertIn("Event Router", tldr)
+        self.assertNotIn("Meet - OK", summary)
+        self.assertLessEqual(theses.count("BI "), 1)
+
+    def test_stage_cache_key_changes_with_effective_prompt(self):
+        first = summary_pipeline_module._stage_cache_key("prompt v1", "ledger")
+        second = summary_pipeline_module._stage_cache_key("prompt v2", "ledger")
+        self.assertNotEqual(first, second)
+        self.assertEqual(summary_pipeline_module.SUMMARY_CACHE_SCHEMA_VERSION, 10)
+
+    def test_merge_cache_invalidates_only_when_effective_prompt_changes(self):
+        cache = {}
+        ledgers = [{"items": []}, {"items": []}]
+        generated = mock.Mock(return_value={"items": []})
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            summary_pipeline_module, "_generate_evidence_ledger", generated
+        ):
+            cache_path = Path(directory) / "summary-cache.json"
+            for prompt in ("merge-v1 {ledgers}", "merge-v1 {ledgers}", "merge-v2 {ledgers}"):
+                summary_pipeline_module._reduce_evidence_ledgers(
+                    ledgers,
+                    "",
+                    cache,
+                    cache_path,
+                    merge_prompt=prompt,
+                    cache_key="test_merges",
+                    stage="test merge",
+                )
+        self.assertEqual(generated.call_count, 2)
 
     def test_summary_builds_and_persists_evidence_ledger(self):
         transcript = "[00:10] Інтерв’юер: Домовились проводити щотижневий sync."
@@ -1434,6 +1666,30 @@ class WatcherStateTests(unittest.TestCase):
             self.assertNotIn("hf_SUPERSECRET", error_file.read_text())
             self.assertNotIn("ntn_NOTIONSECRET", error_file.read_text())
             self.assertEqual(error_file.stat().st_mode & 0o777, 0o600)
+
+    def test_terminal_failure_override_stops_retries_immediately(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            recordings = root / "recordings"
+            failed = root / "failed"
+            notes = root / "notes"
+            for path in (recordings, failed, notes):
+                path.mkdir()
+            session = "2026-01-01_130000"
+            pipeline_utils.atomic_write_json(
+                recordings / f"{session}.json",
+                {"status": "recorded", "processing_attempts": 0},
+            )
+            with mock.patch.object(audio.project_paths, "RECORDINGS", recordings), \
+                    mock.patch.object(audio.project_paths, "FAILED", failed), \
+                    mock.patch.object(audio.project_paths, "NOTES", notes):
+                try:
+                    raise RuntimeError("candidate report repeated the same errors")
+                except RuntimeError:
+                    audio.handle_failure(session, terminal_override=True)
+            manifest = json.loads((recordings / f"{session}.json").read_text())
+            self.assertEqual(manifest["status"], "terminal_failed")
+            self.assertEqual(manifest["processing_attempts"], 1)
 
     def test_interrupted_processing_stops_after_retry_limit(self):
         with tempfile.TemporaryDirectory() as directory:

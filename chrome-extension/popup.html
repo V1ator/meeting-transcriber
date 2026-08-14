@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="uk">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Meeting Transcriber</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <main>
+      <h1>Meeting Transcriber</h1>
+      <label class="mode">
+        <input type="checkbox" id="passive-mode">
+        <span>
+          <strong>Пасивна діагностика</strong>
+          <small>Не керувати CC, не приховувати субтитри й не запускати аудіо.</small>
+        </span>
+      </label>
+      <p id="status">Завантажую налаштування…</p>
+      <p class="hint">Після зміни режиму перезавантажте вкладку Google Meet.</p>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>

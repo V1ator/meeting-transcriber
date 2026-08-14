@@ -56,6 +56,24 @@ test("rejects truncated protobuf instead of leaking partial text", () => {
   assert.equal(Codec.decodeTranscriptPacket(packet.slice(0, -3)), null);
 });
 
+test("packet diagnostics preserve protobuf shape without transcript text", () => {
+  const packet = Fixtures.encodeTranscriptFixture({
+    deviceId: "spaces/private/devices/person-secret",
+    messageId: 7,
+    messageVersion: 1,
+    text: "Конфіденційний текст зустрічі",
+    langId: 44,
+  });
+  const diagnostic = Codec.describePacket(packet);
+  const serialized = JSON.stringify(diagnostic);
+  assert.equal(diagnostic.redacted, true);
+  assert.equal(diagnostic.parsedAsProtobuf, true);
+  assert.match(serialized, /device-id/);
+  assert.match(serialized, /utf8/);
+  assert.doesNotMatch(serialized, /person-secret/);
+  assert.doesNotMatch(serialized, /Конфіденційний/);
+});
+
 test("inflates plain and three-byte-prefixed gzip packets", async () => {
   const packet = Fixtures.encodeTranscriptFixture({
     deviceId: "device-z",
@@ -82,6 +100,27 @@ test("rejects gzip packets that inflate beyond the safety limit", async () => {
   const bomb = new Uint8Array(Codec.MAX_INFLATED_BYTES + 1);
   const gzip = new Uint8Array(gzipSync(bomb));
   assert.equal(await Codec.inflatePacket(gzip), null);
+});
+
+test("encodes Meet media-session caption activation packets", () => {
+  const command = Codec.encodeMediaSessionCaptionCommand(1, "uk-UA");
+  const ack = Codec.encodeMediaSessionAck(7);
+  const serverUpdate = Uint8Array.from([
+    0x0a, 0x06, 0x08, 0x01, 0x22, 0x02, 0x08, 0x03,
+  ]);
+
+  assert.equal(Codec.decodeMediaSessionCommandOp(command), 1);
+  assert.equal(Codec.decodeMediaSessionAckSeq(ack), 7);
+  assert.equal(Codec.decodeMediaSessionServerCounter(serverUpdate), 3);
+  assert.equal(
+    Buffer.from(ack).toString("hex"),
+    "0a060a0410071801"
+  );
+  assert.equal(command.length, 58);
+  assert.ok(Buffer.from(command).includes(Buffer.from("uk-UA")));
+  assert.ok(Buffer.from(command).includes(
+    Buffer.from("client_config.caption_config")
+  ));
 });
 
 test("decodes participant names from a Meet collections packet", () => {

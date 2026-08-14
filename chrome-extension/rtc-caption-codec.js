@@ -8,6 +8,8 @@
   "use strict";
 
   const MAX_INFLATED_BYTES = 1_000_000;
+  const MAX_DIAGNOSTIC_FIELDS = 48;
+  const MAX_DIAGNOSTIC_DEPTH = 5;
 
   const textDecoder = new TextDecoder("utf-8", { fatal: true });
 
@@ -33,6 +35,49 @@
       shift += 7n;
     }
     return null;
+  }
+
+  function encodeVarint(value) {
+    let remaining = BigInt(Math.max(0, Number(value) || 0));
+    const result = [];
+    do {
+      let byte = Number(remaining & 0x7fn);
+      remaining >>= 7n;
+      if (remaining) byte |= 0x80;
+      result.push(byte);
+    } while (remaining);
+    return result;
+  }
+
+  function concatBytes(...parts) {
+    const length = parts.reduce((total, part) => total + part.length, 0);
+    const result = new Uint8Array(length);
+    let offset = 0;
+    parts.forEach((part) => {
+      result.set(part, offset);
+      offset += part.length;
+    });
+    return result;
+  }
+
+  function varintField(number, value) {
+    return Uint8Array.from([
+      ...encodeVarint(number << 3),
+      ...encodeVarint(value),
+    ]);
+  }
+
+  function bytesField(number, value) {
+    const bytes = asBytes(value) || new Uint8Array();
+    return concatBytes(
+      Uint8Array.from(encodeVarint((number << 3) | 2)),
+      Uint8Array.from(encodeVarint(bytes.length)),
+      bytes,
+    );
+  }
+
+  function stringField(number, value) {
+    return bytesField(number, new TextEncoder().encode(String(value || "")));
   }
 
   function safeNumber(value) {
@@ -95,6 +140,76 @@
     }
   }
 
+  function printableString(bytes) {
+    let value = "";
+    try {
+      value = textDecoder.decode(bytes);
+    } catch {
+      return "";
+    }
+    if (!value || value.length > 20_000) return "";
+    const controls = Array.from(value).filter((character) => {
+      const code = character.codePointAt(0);
+      return code < 32 && ![9, 10, 13].includes(code);
+    }).length;
+    return controls / value.length <= 0.05 ? value : "";
+  }
+
+  function diagnosticStringKind(value) {
+    if (/^@?(?:spaces\/)?[^\s/]+\/devices\/[^\s/]+$/i.test(value)) {
+      return "device-id";
+    }
+    if (/^[a-z]{2,3}(?:-[A-Z]{2})?$/.test(value)) return "language-code";
+    return "utf8";
+  }
+
+  function describeFields(bytes, depth, budget) {
+    if (depth > MAX_DIAGNOSTIC_DEPTH || budget.remaining <= 0) return null;
+    const fields = readFields(bytes);
+    if (!fields) return null;
+    const result = [];
+    for (const item of fields) {
+      if (budget.remaining <= 0) break;
+      budget.remaining -= 1;
+      const described = { field: item.field, wire: item.wire };
+      if (item.wire === 0) {
+        described.kind = "varint";
+      } else if (item.wire === 1) {
+        described.kind = "fixed64";
+      } else if (item.wire === 5) {
+        described.kind = "fixed32";
+      } else if (item.wire === 2) {
+        described.length = item.bytes.length;
+        const printable = printableString(item.bytes);
+        if (printable) {
+          described.kind = diagnosticStringKind(printable);
+          described.characters = Array.from(printable).length;
+        } else {
+          const nested = describeFields(item.bytes, depth + 1, budget);
+          described.kind = nested ? "message" : "bytes";
+          if (nested) described.fields = nested;
+        }
+      }
+      result.push(described);
+    }
+    return result;
+  }
+
+  function describePacket(value) {
+    const bytes = asBytes(value);
+    if (!bytes?.length) return null;
+    const fields = describeFields(bytes, 0, {
+      remaining: MAX_DIAGNOSTIC_FIELDS,
+    });
+    return {
+      schemaVersion: 1,
+      byteLength: bytes.length,
+      parsedAsProtobuf: Boolean(fields),
+      fields: fields || [],
+      redacted: true,
+    };
+  }
+
   function decodeTranscriptMessage(bytes) {
     const fields = readFields(bytes);
     if (!fields) return null;
@@ -131,6 +246,56 @@
       if (decoded) return decoded;
     }
     return decodeTranscriptMessage(bytes);
+  }
+
+  function encodeMediaSessionCaptionCommand(op, language) {
+    const captionConfig = concatBytes(
+      stringField(1, language),
+      stringField(2, language),
+    );
+    const clientConfig = bytesField(9, captionConfig);
+    const updateMask = stringField(1, "client_config.caption_config");
+    const captionUpdate = concatBytes(
+      bytesField(1, clientConfig),
+      bytesField(2, updateMask),
+    );
+    const command = concatBytes(
+      varintField(1, op),
+      bytesField(3, captionUpdate),
+    );
+    return bytesField(1, bytesField(2, command));
+  }
+
+  function encodeMediaSessionAck(seq) {
+    const ack = concatBytes(
+      varintField(2, seq),
+      varintField(3, 1),
+    );
+    return bytesField(1, bytesField(1, ack));
+  }
+
+  function decodeMediaSessionCommandOp(value) {
+    const bytes = asBytes(value);
+    const packet = bytes && nestedFields(readFields(bytes), 1);
+    const envelope = packet && nestedFields(packet, 2);
+    const op = envelope && fieldValue(envelope, 1, 0);
+    return op ? safeNumber(op.value) : null;
+  }
+
+  function decodeMediaSessionAckSeq(value) {
+    const bytes = asBytes(value);
+    const packet = bytes && nestedFields(readFields(bytes), 1);
+    const envelope = packet && nestedFields(packet, 1);
+    const seq = envelope && fieldValue(envelope, 2, 0);
+    return seq ? safeNumber(seq.value) : null;
+  }
+
+  function decodeMediaSessionServerCounter(value) {
+    const bytes = asBytes(value);
+    const envelope = bytes && nestedFields(readFields(bytes), 1);
+    const update = envelope && nestedFields(envelope, 4);
+    const counter = update && fieldValue(update, 1, 0);
+    return counter ? safeNumber(counter.value) : null;
   }
 
   function nestedFields(fields, number) {
@@ -213,8 +378,14 @@
   return {
     asBytes,
     decodeDevicePacket,
+    decodeMediaSessionAckSeq,
+    decodeMediaSessionCommandOp,
+    decodeMediaSessionServerCounter,
     decodeMeetingCollection,
     decodeTranscriptPacket,
+    describePacket,
+    encodeMediaSessionAck,
+    encodeMediaSessionCaptionCommand,
     inflatePacket,
     MAX_INFLATED_BYTES,
     readFields,

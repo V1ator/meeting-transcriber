@@ -66,6 +66,7 @@ _render_grounded_sections = summary_pipeline._render_grounded_sections
 _valid_summary = summary_pipeline._valid_summary
 SUMMARY_TEMPLATE = summary_pipeline.SUMMARY_TEMPLATE
 PROMPT_FINGERPRINT = summary_pipeline.PROMPT_FINGERPRINT
+_summary_cache_meta = summary_pipeline._summary_cache_meta
 SUMMARY_EXTRACT_THINK = summary_pipeline.SUMMARY_EXTRACT_THINK
 SUMMARY_RECONCILE_THINK = summary_pipeline.SUMMARY_RECONCILE_THINK
 
@@ -95,6 +96,16 @@ def session_lock(session: str):
 
 def log(message: str) -> None:
     print(f"[{datetime.datetime.now():%Y-%m-%d %H:%M:%S}] {message}", flush=True)
+
+
+def _index_meeting_note(session: str, note: Path) -> None:
+    """Keep local search optional: indexing must never invalidate a ready note."""
+    try:
+        import meeting_search
+
+        meeting_search.index_session(session, note_path=note)
+    except Exception as exc:
+        log(f"  Пошуковий індекс не оновлено ({exc.__class__.__name__}: {exc})")
 
 
 def _is_safe_session_id(session: str) -> bool:
@@ -201,6 +212,7 @@ def _write_short_note(session: str, duration: float) -> Path:
         f"{MIN_SESSION_SECONDS:.0f} с. Транскрипцію та summary пропущено, "
         "щоб не створювати галюцинації на тиші.\n"
     ))
+    _index_meeting_note(session, note)
     return note
 
 
@@ -223,6 +235,7 @@ def _write_silent_note(session: str, duration: float) -> Path:
             f"# Транскрипт {session}\n\n"
             "— Аудіосигнал відсутній; транскрипцію пропущено.\n",
         )
+    _index_meeting_note(session, note)
     return note
 
 
@@ -321,6 +334,68 @@ def _meeting_note_metadata(
             seen.add(key)
             unique_participants.append(participant)
     return meeting_date, meeting_time, meeting_title, unique_participants
+
+
+def create_meet_capture_failure_note(session: str, transcript: str) -> Path:
+    """Create an explicit note for a valid diagnostic export with no captions."""
+    meeting_date, meeting_time, meeting_title, participants = (
+        _meeting_note_metadata(session, transcript, "")
+    )
+    work_dir = project_paths.TRANSCRIPTS / session
+    exported = read_json(work_dir / "meet-captions.json", {}) or {}
+    health = exported.get("captureHealth")
+    if not isinstance(health, dict):
+        health = {}
+    quality_report = finalize_quality_report(session, summary_expected=False)
+    reason = str(health.get("lastFailureReason") or "rtc-unavailable")
+    try:
+        packets = max(0, int(float(health.get("rtcPackets") or 0)))
+    except (TypeError, ValueError):
+        packets = 0
+    try:
+        failures = max(0, int(float(health.get("decodeFailures") or 0)))
+    except (TypeError, ValueError):
+        failures = 0
+
+    ensure_private_dir(project_paths.NOTES)
+    note = project_paths.NOTES / f"{session} — Транскрипт не отримано.md"
+    lines = [
+        f"# Транскрипт не отримано — {meeting_title}",
+        "",
+        f"- **Дата:** {meeting_date}",
+        f"- **Час:** {meeting_time}",
+        f"- **Назва зустрічі:** {meeting_title}",
+        *report_note_lines(quality_report),
+        "",
+        "**Присутні:**",
+        *(f"- {participant}" for participant in participants),
+    ]
+    if not participants:
+        lines.append("- —")
+    lines += [
+        "",
+        "## Що сталося",
+        "",
+        "Розширення було активне, але не отримало жодної репліки live captions. "
+        "Summary не створено, щоб не вигадувати зміст зустрічі.",
+        "",
+        f"- RTC-пакетів: {packets}",
+        f"- Помилок декодування: {failures}",
+        f"- Причина: `{reason}`",
+        "",
+        "## Резервне джерело",
+        "",
+        "Якщо автоматичний аудіозапис запустився, його транскрипт буде "
+        "створено окремою нотаткою після завершення локальної обробки.",
+        "",
+        "---",
+        "",
+        transcript.rstrip(),
+        "",
+    ]
+    atomic_write_text(note, "\n".join(lines))
+    _index_meeting_note(session, note)
+    return note
 
 
 def _candidate_interview_classification(
@@ -447,6 +522,7 @@ def create_note_from_transcript(session: str, transcript: str) -> Path:
         "\n".join(header) + f"\n{summary}\n\n---\n\n"
         f"## Повний транскрипт\n\n{transcript}\n",
     )
+    _index_meeting_note(session, note)
     # Notion є зовнішнім необов'язковим sink: його помилка не повинна
     # скасовувати готову локальну нотатку.
     from notion_agent import sync_note_if_enabled
@@ -714,6 +790,7 @@ def refresh_note_transcript(session: str) -> Path:
         summary = title + "\n\n" + replacement + "\n" + body
 
     atomic_write_text(note, summary.rstrip() + marker + transcript)
+    _index_meeting_note(session, note)
     return note
 
 
@@ -761,17 +838,7 @@ def refresh_summary_render(session: str) -> Path:
     if not _valid_summary(summary, meeting_type):
         raise ValueError("Оновлений summary не пройшов structural validation")
 
-    meta = {
-        "schema_version": 9,
-        "prompt_fingerprint": PROMPT_FINGERPRINT,
-        "meeting_template_version": meeting_templates.TEMPLATE_VERSION,
-        "meeting_type": meeting_type,
-        "model": OLLAMA_MODEL,
-        "num_ctx": OLLAMA_NUM_CTX,
-        "extract_think": SUMMARY_EXTRACT_THINK,
-        "reconcile_think": SUMMARY_RECONCILE_THINK,
-        "transcript_sha256": _sha256_text(transcript),
-    }
+    meta = _summary_cache_meta(transcript, meeting_type)
     cache["_meta"] = meta
     cache["ledger"] = ledger
     cache["quality"] = quality
@@ -793,6 +860,7 @@ def refresh_summary_render(session: str) -> Path:
     if count != 1:
         raise ValueError(f"У note {session} не знайдено summary-блок")
     atomic_write_text(note, refreshed)
+    _index_meeting_note(session, note)
     return note
 
 
@@ -804,12 +872,12 @@ def _redacted_traceback() -> str:
     )
 
 
-def handle_failure(session: str) -> None:
+def handle_failure(session: str, *, terminal_override: bool = False) -> None:
     _require_safe_session_id(session)
     path = manifest_path(session)
     manifest = read_json(path, {}) or {"schema_version": 1, "session": session}
     attempts = max(1, int(manifest.get("processing_attempts", 0) or 0))
-    terminal = attempts >= MAX_AUTO_RETRIES
+    terminal = terminal_override or attempts >= MAX_AUTO_RETRIES
     retry_at = None if terminal else time.time() + min(3600, 60 * 2 ** (attempts - 1))
     trace = _redacted_traceback()
     ensure_private_dir(project_paths.FAILED)

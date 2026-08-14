@@ -173,6 +173,90 @@ class CandidateRoutingTests(unittest.TestCase):
 
 
 class CandidateEvaluationTests(unittest.TestCase):
+    def test_evidence_grounding_repairs_ellipsis_at_one_timestamp(self):
+        transcript = (
+            "[13:21:38] Jane: Я зробила систему для контролю витрат і вона "
+            "допомогла команді уникнути зайвих платежів."
+        )
+        evidence = """[E1.1] speaker=candidate | type=candidate_self_report | situation=impact | timestamp=13:21:38 | dimensions=Experience relevance | signals=impact
+"Я зробила систему для контролю витрат ... уникнути зайвих платежів"
+"""
+        grounded, dropped = candidate_evaluation._ground_evidence_ledger(
+            evidence, transcript
+        )
+        self.assertEqual(dropped, [])
+        self.assertIn(
+            "я зробила систему для контролю витрат і вона допомогла команді "
+            "уникнути зайвих платежів",
+            grounded,
+        )
+
+    def test_evidence_grounding_drops_mismatch_and_cross_turn_stitch(self):
+        transcript = "\n".join([
+            "[13:07:34] Jane: Я працювала з Google інструментами.",
+            "[13:32:54] Jane: Інкрементально оновлюємо лише нові рядки.",
+            "[13:33:13] Jane: Це потрібно для ефективності.",
+        ])
+        evidence = """[E1.1] speaker=candidate | type=candidate_self_report | situation=tools | timestamp=13:07:34 | dimensions=Motivation | signals=
+"Я працювала з Gogole інструментами"
+
+[E1.2] speaker=candidate | type=candidate_live | situation=dbt | timestamp=13:32:54 | dimensions=Critical thinking | signals=
+"Інкрементально оновлюємо лише нові рядки ... Це потрібно для ефективності"
+"""
+        grounded, dropped = candidate_evaluation._ground_evidence_ledger(
+            evidence, transcript
+        )
+        self.assertEqual(grounded, "")
+        self.assertEqual(dropped, ["1.1", "1.2"])
+
+    def test_report_normalization_grounds_quotes_caps_confidence_and_ids(self):
+        evidence = """[E1.1] speaker=candidate | type=candidate_self_report | situation=case_one | timestamp=00:01:00 | dimensions=Motivation | signals=impact
+"Це точна цитата кандидата"
+
+[E1.2] speaker=candidate | type=candidate_live | situation=case_two | timestamp=00:02:00 | dimensions=Motivation | signals=impact
+"Друга точна цитата"
+"""
+        report = """| Мотивація | 3 | Висока | опис |
+
+### 1. Мотивація — 3 (Висока)
+> [E1.1] «Неточний переказ» (00:01:00)
+> [E1.2] «Друга точна цитата» (00:02:00)
+
+## Основні ризики найму
+| Ризик | Статус | Доказ і умова прояву |
+|---|---|---|
+| Ризик | Умовний | E1.1: умова |
+"""
+        normalized = candidate_evaluation._normalize_generated_report(
+            report, evidence
+        )
+        self.assertIn("| Мотивація | 3 | Середня |", normalized)
+        self.assertIn("Мотивація — 3 (Середня)", normalized)
+        self.assertIn("«Це точна цитата кандидата»", normalized)
+        self.assertIn("[E1.1]: умова", normalized)
+        self.assertIn("## Заходи зниження ризиків", normalized)
+
+    def test_report_normalization_splits_grouped_evidence_ids(self):
+        report = (
+            "| Ризик | Умовний висновок | [E2.1, E2.3] опис; "
+            "E1.4 додатково; [E4.]7] legacy; [E5.1, [E5.2]; "
+            "[E6.1]2]; Analytics [Engineer] |"
+        )
+        normalized = candidate_evaluation._normalize_report_evidence_ids(report)
+        self.assertEqual(
+            normalized,
+            "| Ризик | Умовний висновок | [E2.1], [E2.3] опис; "
+            "[E1.4] додатково; [E4.7] legacy; [E5.1], [E5.2]; "
+            "[E6.12]; Analytics Engineer |",
+        )
+        self.assertNotIn("[E2.]3", normalized)
+
+    def test_report_normalization_renames_risk_mitigation_alias(self):
+        report = "## Мітигації ризиків\n\n- Перевірити кейсом."
+        normalized = candidate_evaluation._ensure_risk_mitigation_section(report)
+        self.assertIn("## Заходи зниження ризиків", normalized)
+        self.assertNotIn("## Мітигації ризиків", normalized)
+
     def test_single_evidence_chunk_skips_lossy_consolidation(self):
         part = """[E1.1] speaker=candidate | type=candidate_live | situation=case | timestamp=00:01:00 | dimensions=motivation | signals=none
 "Дослівна цитата кандидата"
@@ -285,6 +369,20 @@ class CandidateEvaluationTests(unittest.TestCase):
             "цитата `[E1.1]` не підтверджена evidence ledger", errors
         )
         self.assertIn("цитата `[E1.1]` не знайдена у транскрипті", errors)
+
+    def test_report_rejects_malformed_evidence_ids(self):
+        report = valid_ukrainian_report() + (
+            "\n| Middle | Відповідає | Середня | "
+            "Докази [E2.2, [E2.3] | - |"
+        )
+        errors = candidate_report_validator.validate_candidate_report(
+            report,
+            candidate="Jane Doe",
+            target="",
+            interview_stage="Невідомий",
+            levels=("Junior", "Middle"),
+        )
+        self.assertIn("некоректно відформатовані evidence ID", errors)
 
     def test_target_fit_requires_both_role_and_explicit_level(self):
         report = valid_ukrainian_report(
@@ -585,13 +683,40 @@ class CandidateEvaluationTests(unittest.TestCase):
             )
             with self.assertRaises(candidate_evaluation.CandidateEvaluationError):
                 candidate_evaluation.evaluate(**common, generate=first)
-            self.assertIn("invalid_report", candidate_evaluation.read_json(cache_path))
-            candidate_evaluation.evaluate(
-                **common, generate=mock.Mock(return_value=report)
-            )
+            failed_cache = candidate_evaluation.read_json(cache_path)
+            self.assertIn("invalid_report", failed_cache)
+            self.assertTrue(failed_cache["invalid_report_errors"])
+            retry = mock.Mock(return_value=report)
+            candidate_evaluation.evaluate(**common, generate=retry)
+            self.assertIn("<VALIDATION_ERRORS>", retry.call_args.args[0])
             cache = candidate_evaluation.read_json(cache_path)
         self.assertNotIn("invalid_report", cache)
         self.assertNotIn("invalid_report_at", cache)
+        self.assertNotIn("invalid_report_errors", cache)
+
+    def test_identical_invalid_report_becomes_terminal(self):
+        invalid = "English report without the required structure"
+        with tempfile.TemporaryDirectory() as directory:
+            cache_path = Path(directory) / "cache.json"
+            common = dict(
+                transcript="[00:01] Jane: hello",
+                candidate="Jane Doe",
+                target_level="",
+                levels=("Junior",),
+                meeting_title="Interview | Jane Doe",
+                meeting_date="2026-07-31",
+                interviewers=["Interviewer"],
+                cache_path=cache_path,
+            )
+            first = mock.Mock(side_effect=["evidence", "calibration", invalid])
+            with self.assertRaises(candidate_evaluation.CandidateEvaluationError):
+                candidate_evaluation.evaluate(**common, generate=first)
+            with self.assertRaises(
+                candidate_evaluation.CandidateEvaluationTerminalError
+            ):
+                candidate_evaluation.evaluate(
+                    **common, generate=mock.Mock(return_value=invalid)
+                )
 
     def test_generation_profile_invalidates_evidence_cache(self):
         report = valid_ukrainian_report()
