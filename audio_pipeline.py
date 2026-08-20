@@ -47,12 +47,15 @@ CANDIDATE_TARGET_LEVEL = os.environ.get("CANDIDATE_TARGET_LEVEL", "").strip()
 CANDIDATE_OLLAMA_THINK = (
     os.environ.get("CANDIDATE_OLLAMA_THINK", "true").lower() == "true"
 )
+CANDIDATE_CALIBRATION_NUM_PREDICT = int(
+    os.environ.get("CANDIDATE_CALIBRATION_NUM_PREDICT", "2000")
+)
 ROTATE_DAYS = int(os.environ.get("ROTATE_DAYS", "5"))
 MIN_SESSION_SECONDS = float(os.environ.get("MIN_SESSION_SECONDS", "10"))
 SILENT_RECORDING_PEAK_DBFS = float(
     os.environ.get("SILENT_RECORDING_PEAK_DBFS", "-70")
 )
-MAX_AUTO_RETRIES = int(os.environ.get("MAX_AUTO_RETRIES", "8"))
+MAX_AUTO_RETRIES = int(os.environ.get("MAX_AUTO_RETRIES", "5"))
 STABLE_SECONDS = 60
 SESSION_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 
@@ -540,7 +543,9 @@ def _candidate_generation_options(system: str) -> tuple[int, bool]:
         return 1800, False
     if "reasoning-калібрування" in system:
         return (
-            6144 if CANDIDATE_OLLAMA_THINK else 3000,
+            CANDIDATE_CALIBRATION_NUM_PREDICT
+            if CANDIDATE_OLLAMA_THINK
+            else 3000,
             CANDIDATE_OLLAMA_THINK,
         )
     if "форматуєш фінальний hiring report" in system:
@@ -549,6 +554,39 @@ def _candidate_generation_options(system: str) -> tuple[int, bool]:
         6144 if CANDIDATE_OLLAMA_THINK else 4096,
         CANDIDATE_OLLAMA_THINK,
     )
+
+
+def _generate_candidate_response(prompt: str, system: str) -> str:
+    """Generate one candidate stage with local calibration recovery."""
+    num_predict, think = _candidate_generation_options(system)
+    is_calibration = "reasoning-калібрування" in system
+    try:
+        return summary_pipeline.ollama_generate(
+            prompt,
+            system=system,
+            num_predict=num_predict,
+            think=think,
+            thinking_recovery_prompt=(
+                """Сформуй decision brief до 3000 символів із уже виконаного
+reasoning: scores і confidence для п'яти вимірів, demonstrated level, target
+fit, рекомендацію поточного етапу, допустимість фінального рішення, прямі
+ризики, mitigations та конкретні bias adjustments. Відокрем підтверджений
+рівень від часткових сигналів наступного рівня."""
+                if is_calibration and think
+                else ""
+            ),
+            fallback_num_predict=4000 if is_calibration and think else None,
+            recovery_num_predict=3000,
+        )
+    except ValueError as exc:
+        if is_calibration and "порожню відповідь" in str(exc):
+            from candidate_evaluation import CandidateEvaluationTerminalError
+
+            raise CandidateEvaluationTerminalError(
+                "Candidate calibration не сформувала response навіть після "
+                "локального reasoning recovery; повний retry сесії не допоможе"
+            ) from exc
+        raise
 
 
 def create_candidate_evaluation_from_transcript(
@@ -562,15 +600,22 @@ def create_candidate_evaluation_from_transcript(
 ) -> Path:
     """Run the locally installed candidate skill and create one feedback task."""
     import candidate_evaluation
+    from meeting_classifier import same_person
     from notion_agent import sync_evaluation_feedback_if_enabled
 
     candidate = candidate_evaluation.candidate_name(meeting_title, participants)
     classification = classification or _candidate_interview_classification(
         session, transcript, meeting_title
     )
+    evidence_transcript = _transcript_through_timestamp(
+        transcript, str(classification.get("candidate_last_timestamp", ""))
+    )
+    interviewer_debrief = _transcript_after_timestamp(
+        transcript, str(classification.get("candidate_last_timestamp", ""))
+    )
     interviewers = [
         participant for participant in participants
-        if participant.casefold() != candidate.casefold()
+        if not same_person(participant, candidate)
     ]
     update_manifest(
         manifest_path(session), status="processing", stage="candidate-evaluation"
@@ -602,7 +647,7 @@ def create_candidate_evaluation_from_transcript(
         return path
 
     report = candidate_evaluation.evaluate(
-        transcript,
+        evidence_transcript,
         candidate=candidate,
         target_level=(
             candidate_evaluation.target_level_from_title(meeting_title)
@@ -612,11 +657,7 @@ def create_candidate_evaluation_from_transcript(
         meeting_title=meeting_title,
         meeting_date=meeting_date,
         interviewers=interviewers,
-        generate=lambda prompt, system: summary_pipeline.ollama_generate(
-            prompt, system=system,
-            num_predict=_candidate_generation_options(system)[0],
-            think=_candidate_generation_options(system)[1],
-        ),
+        generate=_generate_candidate_response,
         cache_path=project_paths.TRANSCRIPTS / session / "candidate-evaluation-cache.json",
         cache_profile={
             "model": OLLAMA_MODEL,
@@ -626,8 +667,10 @@ def create_candidate_evaluation_from_transcript(
             # `final_think` now applies to the calibration brief, while report
             # formatting is deliberately non-reasoning.
             "final_think": CANDIDATE_OLLAMA_THINK,
+            "calibration_num_predict": CANDIDATE_CALIBRATION_NUM_PREDICT,
         },
         progress=lambda message: log(f"  Candidate: {message}"),
+        interviewer_debrief=interviewer_debrief,
     )
     path = candidate_evaluation.save_report(
         report,
@@ -645,6 +688,38 @@ def create_candidate_evaluation_from_transcript(
         logger=log,
     )
     return path
+
+
+def _transcript_through_timestamp(transcript: str, timestamp: str) -> str:
+    """Exclude interviewer-only discussion after the candidate's last turn."""
+    if not timestamp.strip():
+        return transcript
+    lines = transcript.splitlines()
+    cutoff = None
+    marker = re.compile(rf"^\[{re.escape(timestamp.strip())}\]\s+")
+    for index, line in enumerate(lines):
+        if marker.match(line.strip()):
+            cutoff = index
+    if cutoff is None:
+        return transcript
+    result = "\n".join(lines[: cutoff + 1])
+    return result + ("\n" if transcript.endswith("\n") else "")
+
+
+def _transcript_after_timestamp(transcript: str, timestamp: str) -> str:
+    """Return interviewer-only debrief after the candidate's last turn."""
+    if not timestamp.strip():
+        return ""
+    lines = transcript.splitlines()
+    cutoff = None
+    marker = re.compile(rf"^\[{re.escape(timestamp.strip())}\]\s+")
+    for index, line in enumerate(lines):
+        if marker.match(line.strip()):
+            cutoff = index
+    if cutoff is None or cutoff + 1 >= len(lines):
+        return ""
+    result = "\n".join(lines[cutoff + 1:]).strip()
+    return result + ("\n" if result else "")
 
 
 def evaluate_candidate_session(session: str) -> Path:
@@ -877,9 +952,27 @@ def handle_failure(session: str, *, terminal_override: bool = False) -> None:
     path = manifest_path(session)
     manifest = read_json(path, {}) or {"schema_version": 1, "session": session}
     attempts = max(1, int(manifest.get("processing_attempts", 0) or 0))
-    terminal = terminal_override or attempts >= MAX_AUTO_RETRIES
-    retry_at = None if terminal else time.time() + min(3600, 60 * 2 ** (attempts - 1))
     trace = _redacted_traceback()
+    last_error = trace.splitlines()[-1] if trace.splitlines() else "unknown"
+    error_kind = (
+        "empty_response"
+        if "порожню відповідь" in last_error
+        else "other"
+    )
+    previous_kind = str(manifest.get("last_error_kind", ""))
+    previous_count = int(manifest.get("same_error_attempts", 0) or 0)
+    same_error_attempts = previous_count + 1 if previous_kind == error_kind else 1
+    repeated_empty_response = (
+        error_kind == "empty_response" and same_error_attempts >= 2
+    )
+    terminal = (
+        terminal_override
+        or repeated_empty_response
+        or attempts >= MAX_AUTO_RETRIES
+    )
+    retry_at = None if terminal else time.time() + min(
+        3600, 60 * 2 ** (attempts - 1)
+    )
     ensure_private_dir(project_paths.FAILED)
     error_file = project_paths.FAILED / f"{session}.log"
     atomic_write_text(error_file, trace, mode=0o600)
@@ -891,10 +984,18 @@ def handle_failure(session: str, *, terminal_override: bool = False) -> None:
         stage="failed",
         processing_attempts=attempts,
         next_retry_at=retry_at,
-        last_error=trace.splitlines()[-1] if trace.splitlines() else "unknown",
+        last_error=last_error,
+        last_error_kind=error_kind,
+        same_error_attempts=same_error_attempts,
     )
     if terminal:
-        log(f"  ПОМИЛКА: {session}; вичерпано {attempts} спроб → {error_file}")
+        if repeated_empty_response:
+            reason = "Ollama двічі повернула порожню відповідь"
+        elif terminal_override:
+            reason = "термінальна помилка без повного retry"
+        else:
+            reason = f"вичерпано {attempts} спроб"
+        log(f"  ПОМИЛКА: {session}; {reason} → {error_file}")
     else:
         wait = int(retry_at - time.time())
         log(f"  ПОМИЛКА: {session}; retry #{attempts + 1} через ~{wait} с")

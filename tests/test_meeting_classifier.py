@@ -34,6 +34,77 @@ class CandidateInterviewClassifierTests(unittest.TestCase):
         self.assertEqual(result["outcome"], "completed")
         self.assertTrue(result["candidate_evaluation_eligible"])
 
+    def test_transliterated_title_matches_cyrillic_caption_speaker(self):
+        transcript = "\n".join(
+            [
+                f"[10:{index:02d}] Катерина Лисенко: Детальна відповідь {index} "
+                "про власний досвід, рішення, результат і зроблені висновки."
+                for index in range(1, 8)
+            ]
+            + ["[10:09] Oleh Parandii: Дякую, співбесіду завершено."]
+        )
+        result = meeting_classifier.classify_candidate_interview(
+            "Hiring manager Interview | Kateryna Lysenko | Data Analyst",
+            transcript,
+        )
+        self.assertEqual(result["outcome"], "completed")
+        self.assertTrue(result["candidate_evaluation_eligible"])
+        self.assertEqual(result["candidate_last_timestamp"], "10:07")
+        self.assertTrue(
+            meeting_classifier.same_person("Катерина Лисенко", "Kateryna Lysenko")
+        )
+
+    def test_initial_ye_transliteration_variants_match_with_exact_surname(self):
+        self.assertTrue(
+            meeting_classifier.same_person("Євгеній Мартиненко", "Evhenii Martynenko")
+        )
+        self.assertTrue(
+            meeting_classifier.same_person("Євгеній Мартиненко", "Yevhenii Martynenko")
+        )
+        self.assertFalse(
+            meeting_classifier.same_person("Євгеній Інший", "Evhenii Martynenko")
+        )
+
+    def test_meet_reversed_cyrillic_name_matches_title(self):
+        self.assertTrue(
+            meeting_classifier.same_person("Крочак Сергій", "Serhii Krochak")
+        )
+        self.assertFalse(
+            meeting_classifier.same_person("Інший Сергій", "Serhii Krochak")
+        )
+
+    def test_evhenii_interview_is_evaluation_eligible(self):
+        transcript = "\n".join(
+            [
+                f"[10:{index:02d}] Євгеній Мартиненко: Детальна відповідь {index} "
+                "про досвід, власні дії, отриманий результат і висновки."
+                for index in range(1, 8)
+            ]
+            + ["[10:09] Oleh Parandii: Дякую, співбесіду завершено."]
+        )
+        result = meeting_classifier.classify_candidate_interview(
+            "Bar-Raising Interview | Evhenii Martynenko | BI Analyst",
+            transcript,
+        )
+        self.assertEqual(result["outcome"], "completed")
+        self.assertTrue(result["candidate_evaluation_eligible"])
+        self.assertEqual(result["candidate_last_timestamp"], "10:07")
+
+    def test_long_interview_with_unresolved_identity_requires_review(self):
+        transcript = "\n".join(
+            [
+                f"[10:{index:02d}] Невідомий Спікер: Детальна відповідь {index} "
+                + "із контекстом, власними діями, результатом і висновками. " * 4
+                for index in range(1, 9)
+            ]
+        )
+        result = meeting_classifier.classify_candidate_interview(
+            "Interview | Jane Doe | Data Analyst",
+            transcript,
+        )
+        self.assertEqual(result["outcome"], "identity_unresolved")
+        self.assertFalse(result["candidate_evaluation_eligible"])
+
     def test_too_few_candidate_answers_are_insufficient(self):
         result = meeting_classifier.classify_candidate_interview(
             "Interview | Jane Doe | Data Analyst",

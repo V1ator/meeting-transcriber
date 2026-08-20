@@ -145,7 +145,9 @@ def _evidence_records(evidence: str) -> dict[str, dict[str, str]]:
         r"situation=(?P<situation>[^|\n]+)\|\s*"
         r"timestamp=(?P<timestamp>[^|\n]+)\|\s*"
         r"dimensions=(?P<dimensions>[^|\n]+)\|\s*"
-        r"signals=(?P<signals>[^\n]+)$"
+        r"signals=(?P<signals>[^|\n]*)"
+        r"(?:\|\s*phase=(?P<phase>[^|\n]+))?"
+        r"(?:\|\s*support=(?P<support>[^|\n]+))?\s*$"
     )
     for match in pattern.finditer(evidence or ""):
         records[match.group("id")] = {
@@ -154,6 +156,12 @@ def _evidence_records(evidence: str) -> dict[str, dict[str, str]]:
                 "speaker", "type", "situation", "timestamp", "dimensions", "signals"
             )
         }
+        records[match.group("id")]["phase"] = (
+            match.group("phase") or ""
+        ).strip().casefold()
+        records[match.group("id")]["support"] = (
+            match.group("support") or ""
+        ).strip().casefold()
     return records
 
 
@@ -275,6 +283,7 @@ def validate_candidate_report(
     levels: Iterable[str],
     evidence: str = "",
     transcript: str = "",
+    interviewer_debrief: str = "",
 ) -> list[str]:
     """Return actionable report-policy violations without judging semantic scores."""
     errors: list[str] = []
@@ -400,7 +409,7 @@ def validate_candidate_report(
         if evidence and not cited_ids:
             errors.append(f"числова оцінка `{dimension}` без evidence ID")
         cited_records = [records[value] for value in cited_ids if value in records]
-        if evidence and cited_ids and not cited_records:
+        if evidence and any(value not in records for value in cited_ids):
             errors.append(f"`{dimension}` посилається на невідомі evidence ID")
 
         if "висок" in confidence.casefold() or "high" in confidence.casefold():
@@ -442,12 +451,82 @@ def validate_candidate_report(
                     "числова оцінка bias awareness без прямого bias-сигналу"
                 )
 
+    reflection_row = re.search(
+        r"(?mi)^\|\s*Рефлексія\s*\|\s*([^|]+)\|", report
+    )
+    reflection_signals = {
+        value.strip()
+        for item in records.values()
+        if "reflection" in item["dimensions"] or "рефлексія" in item["dimensions"]
+        for value in item["signals"].split(",")
+    }
+    if (
+        reflection_row
+        and "недостатньо" in reflection_row.group(1).casefold()
+        and reflection_signals.intersection({"lesson", "behavior_change"})
+    ):
+        errors.append(
+            "рефлексію позначено Недостатньо даних попри прямий "
+            "lesson/behavior_change evidence"
+        )
+
+    affinity_pattern = re.compile(
+        r"(?i)подоба\w*|сподоба\w*|понрав\w*|типаж|"
+        r"схож\w*\s+(?:на\s+)?(?:мене|нас)|"
+        r"люблю\s+таких|близьк\w*\s+(?:мені|нам)\s+люд"
+    )
+    if interviewer_debrief and affinity_pattern.search(interviewer_debrief):
+        bias_section = re.search(
+            r"(?ms)^##\s+Самоперевірка упереджень оцінювача\s*"
+            r"(.*?)(?=^##\s+|\Z)",
+            report,
+        )
+        bias_text = bias_section.group(1).casefold() if bias_section else ""
+        similarity_line = re.search(
+            r"(?mi)^-\s*\*\*Similarity:\*\*\s*(.+)$", bias_text
+        )
+        names_affinity = bool(re.search(
+            r"similarity|affinity|схож|подібн|симпат|типаж", bias_text
+        ))
+        denies_bias = bool(
+            similarity_line
+            and re.search(
+                r"не\s+(?:виявлен|зафіксован|спостережен)|відсутн",
+                similarity_line.group(1),
+            )
+        )
+        if not names_affinity or denies_bias:
+            errors.append(
+                "self-check не відобразив similarity/affinity bias з debrief"
+            )
+
     level_rows = re.findall(
         r"(?mi)^\|\s*([^|]+)\|\s*(Нижче|Below)\s*\|([^\n]+)$", report
     )
     for level, _, remainder in level_rows:
         if re.search(r"(?i)не перевір|немає даних|відсутн\w+(?:\s+дан|\s+доказ)", remainder):
-            if not re.search(r"(?i)супереч|contradict|прям\w+\s+негатив", remainder):
+            cited_records = [
+                records[value]
+                for value in _cited_evidence_ids(remainder)
+                if value in records
+            ]
+            negative_signals = {
+                "needs_guidance",
+                "limited_autonomy",
+                "linear_thinking",
+                "missed_optimization",
+                "execution_only",
+                "confusion",
+            }
+            has_direct_negative = any(
+                negative_signals.intersection(
+                    value.strip() for value in item["signals"].split(",")
+                )
+                for item in cited_records
+            )
+            if not has_direct_negative and not re.search(
+                r"(?i)супереч|contradict|прям\w+\s+негатив", remainder
+            ):
                 errors.append(
                     f"рівень `{level.strip()}` позначено Нижче лише через відсутність даних"
                 )
@@ -465,5 +544,13 @@ def validate_candidate_report(
     for row in risk_rows:
         if not re.search(r"\[E[A-Za-z0-9._-]+\]", row):
             errors.append("ризик найму без evidence ID")
+        if re.search(
+            r"(?i)не\s+перевір|не\s+підтвердж|немає\s+(?:даних|доказів)|"
+            r"не\s+згадан|даних\s+недостатньо",
+            row,
+        ):
+            errors.append(
+                "неперевірену компетенцію помилково оформлено як ризик найму"
+            )
 
-    return errors
+    return list(dict.fromkeys(errors))

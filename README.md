@@ -327,11 +327,33 @@ Interview | Jane Doe | Senior Data Engineer | Hiring Manager
 Оцінювання використовує reasoning окремо від звичайних нотаток. Він вмикається
 для фінального verdict; механічне витягування цитат працює швидше без reasoning:
 
+- докази збираються двома фокусованими проходами: профіль/досвід і
+  live-задачі/рефлексія;
+- для live-задач окремо фіксуються початкова відповідь, рівень підказки,
+  оновлення та фінальна відповідь;
+- обговорення інтерв’юерів після виходу кандидата використовується лише для
+  self-check упереджень і не впливає на бали;
+- evidence ledger об’єднується детерміновано, без окремого виклику LLM;
+- для Trainee комерційний досвід оцінюється окремо від технічної готовності та
+  learning potential.
+- якщо reasoning-калібрування заповнило лише поле `thinking`, короткий
+  non-reasoning виклик формує з нього decision brief; якщо немає навіть
+  `thinking`, один раз повторюється лише калібрування з лімітом 4000;
+- після невдалого локального recovery сесія завершується контрольованою
+  помилкою замість восьми повних повторів candidate flow.
+- якщо фінальний hiring report не проходить структурну перевірку, один
+  додатковий виклик виправляє лише готовий звіт із того самого evidence та
+  calibration brief; повторний структурний провал одразу зупиняє сесію.
+- порожня відповідь Ollama спочатку повторює лише поточний виклик; якщо ще й
+  наступний повний запуск завершується порожньою відповіддю, сесія зупиняється
+  незалежно від загального ліміту retry.
+
 ```dotenv
 OLLAMA_THINK=false
 SUMMARY_EXTRACT_THINK=false
 SUMMARY_RECONCILE_THINK=true
 CANDIDATE_OLLAMA_THINK=true
+CANDIDATE_CALIBRATION_NUM_PREDICT=2000
 CANDIDATE_LEVELS=Junior,Middle,Senior,Lead
 CANDIDATE_TARGET_LEVEL= # роль і рівень, наприклад Junior Data Analyst
 ```
@@ -393,12 +415,13 @@ sync state — у двох атомарних копіях.
 | `SUMMARY_CRITICAL_MERGE_NUM_PREDICT` | ліміт відповіді для великого critical-evidence JSON merge; default `8192` |
 | `SUMMARY_CRITICAL_RECONCILE_NUM_PREDICT` | ліміт JSON після reasoning-узгодження; default `8192` |
 | `CANDIDATE_OLLAMA_THINK` | reasoning лише для оцінки кандидатів |
+| `CANDIDATE_CALIBRATION_NUM_PREDICT` | ліміт reasoning-калібрування кандидата; default `2000` |
 | `MEET_AUTO_IMPORT` | автоматичний імпорт Meet JSON |
 | `MEET_AUTO_SUMMARY` | автоматичне створення нотатки після імпорту |
 | `NOTION_TASK_OWNER_NAMES` | імена/аліаси власника; на борду потрапляють лише його action items |
 | `TRANSCRIBE_LANGUAGE` | `uk` або `auto` для аудіо-ASR |
 | `MIC_AUTO_START` | автоматично реагувати на активний мікрофон |
-| `MAX_AUTO_RETRIES` | кількість спроб; default `8` дає близько двох годин retry-вікна |
+| `MAX_AUTO_RETRIES` | загальна кількість спроб для тимчасових збоїв; default `5` дає близько 15 хв очікування між ними |
 | `ROTATE_DAYS` | через скільки днів видаляти завершені WAV; `0` — ніколи |
 
 Перемикачі `AUDIO_PIPELINE_ENABLED`, `CANDIDATE_EVALUATION_ENABLED` і

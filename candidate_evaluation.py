@@ -326,6 +326,15 @@ def _ground_evidence_ledger(
         end = headers[index + 1].start() if index + 1 < len(headers) else len(evidence)
         block = evidence[header.start():end].strip()
         lines = block.splitlines()
+        if "speaker=candidate|interviewer" in lines[0]:
+            speaker = (
+                "interviewer"
+                if "type=interviewer_commentary" in lines[0]
+                else "candidate"
+            )
+            lines[0] = lines[0].replace(
+                "speaker=candidate|interviewer", f"speaker={speaker}", 1
+            )
         quote_index = next((
             line_index for line_index, line in enumerate(lines[1:], start=1)
             if line.strip()
@@ -368,42 +377,63 @@ def _extract_evidence(
     cached_parts = cache.setdefault("evidence", {}) if cache is not None else {}
     chunks = _chunks(transcript)
     total = len(chunks)
+    focuses = (
+        (
+            "profile",
+            "мотивація, релевантність досвіду та level signals",
+            """Збери причину зміни роботи, внутрішню мотивацію до професії,
+мотивацію саме до ролі й компанії. Для досвіду окремо шукай domain depth,
+особистий scope, ownership/autonomy, ambiguity, decision quality, impact,
+leverage і breadth. Не занижуй оцінку лише через відсутність комерційного
+досвіду, особливо для Trainee/Junior; фіксуй технічну готовність і learning
+potential окремо.""",
+        ),
+        (
+            "behavior",
+            "live tasks, critical thinking, reflection та bias awareness",
+            """Спочатку переглянь увесь чанк. Не пропускай короткі репліки про
+власну помилку, отриманий урок, подальшу зміну поведінки або зміну позиції прямо
+під час інтерв'ю. Для кожної live-задачі збережи до трьох ключових фаз:
+initial, scaffolding/update і final. У metadata після signals додай
+`phase=initial|scaffolding|update|final|reflection | support=none|general|targeted|step_by_step`.
+Загальне «можна краще» є general support; конкретний наступний крок або готова
+частина розв'язку — targeted/step_by_step. Не приписуй кандидату підказку
+інтерв'юера. `bias_*` став лише за прямий bias probe/update/mitigation.""",
+        ),
+    )
     for index, chunk in enumerate(chunks, start=1):
-        key = hashlib.sha256(chunk.encode("utf-8")).hexdigest()
-        if key in cached_parts:
-            cached, dropped = _ground_evidence_ledger(
-                str(cached_parts[key]), transcript
+        chunk_results: list[str] = []
+        for focus_code, focus_label, focus_rules in focuses:
+            key = (
+                f"focused-v2:{focus_code}:"
+                f"{hashlib.sha256(chunk.encode('utf-8')).hexdigest()}"
             )
-            if dropped and progress:
-                progress(
-                    f"evidence {index}/{total} — відкинуто недослівних: "
-                    f"{len(dropped)}"
+            if key in cached_parts:
+                cached, dropped = _ground_evidence_ledger(
+                    str(cached_parts[key]), transcript
                 )
-            if cached != cached_parts[key]:
-                cached_parts[key] = cached
-                if cache_path is not None:
-                    atomic_write_json(cache_path, cache, mode=0o600)
+                if cached:
+                    chunk_results.append(cached)
+                if cached != cached_parts[key]:
+                    cached_parts[key] = cached
+                    if cache_path is not None:
+                        atomic_write_json(cache_path, cache, mode=0o600)
+                if progress:
+                    progress(f"evidence {index}/{total} {focus_code} — кеш")
+                continue
+            started = time.monotonic()
             if progress:
-                progress(f"evidence {index}/{total} — кеш")
-            results.append(cached)
-            continue
-        started = time.monotonic()
-        if progress:
-            progress(f"evidence {index}/{total} — аналіз")
-        prompt = f"""Збери лише фактичні докази для п'яти вимірів і рівнів нижче.
+                progress(f"evidence {index}/{total} {focus_code} — аналіз")
+            prefix = "P" if focus_code == "profile" else "B"
+            prompt = f"""Збери лише фактичні докази для фокуса: {focus_label}.
+{focus_rules}
 Поверни evidence ledger. Кожен запис починай одним рядком точно у форматі:
-`[E{index}.N] speaker=candidate|interviewer | type=candidate_live|candidate_self_report|interviewer_commentary|corroborated | situation=<stable_id> | timestamp=<HH:MM:SS> | dimensions=<csv> | signals=<csv>`.
-Наступним рядком наведи коротку дослівну НЕПЕРЕРВНУ цитату. Заборонено
+`[E{index}{prefix}.N] speaker=candidate|interviewer | type=candidate_live|candidate_self_report|interviewer_commentary|corroborated | situation=<stable_id> | timestamp=<HH:MM:SS> | dimensions=<csv> | signals=<csv>`.
+Наступним рядком наведи коротку (8–40 слів) дослівну НЕПЕРЕРВНУ цитату. Заборонено
 скорочувати цитату через `...` або `…`, склеювати її частини чи переказувати.
-Не створюй окремі записи для кількох цитат з однієї репліки. Для кожного виміру
-збери докази, контрдокази та
-оцінку достатності сигналу. Відокремлюй слова кандидата від коментарів
-інтерв'юерів; відсутність probe позначай `Не перевірено`. Використовуй signals
-`own_mistake`, `lesson`, `behavior_change` лише коли вони явно присутні;
-`bias_probe`, `bias_update`, `bias_mitigation`, `observed_bias` — лише для прямих
-bias-сигналів. Окремо витягни докази scope,
-autonomy, ambiguity, decision quality, impact і leverage для рівнів
-{', '.join(levels)}. Нічого не вигадуй.
+Не створюй окремі записи для кількох цитат з однієї репліки. Максимум 10
+найінформативніших записів. Якщо доказів для цього фокуса немає, поверни
+`NO_EVIDENCE`. Нічого не вигадуй.
 
 <CALIBRATION_ANCHORS>
 {anchors}
@@ -416,27 +446,45 @@ autonomy, ambiguity, decision quality, impact і leverage для рівнів
 {chunk}
 </TRANSCRIPT_CHUNK>
 """
-        result = generate(prompt, system)
-        result, dropped = _ground_evidence_ledger(result, transcript)
-        if dropped and progress:
-            progress(
-                f"evidence {index}/{total} — відкинуто недослівних: "
-                f"{len(dropped)}"
-            )
-        if not result.strip():
+            raw_result = generate(prompt, system)
+            if raw_result.strip() == "NO_EVIDENCE":
+                result, dropped = "", []
+            else:
+                result, dropped = _ground_evidence_ledger(raw_result, transcript)
+            if not result.strip() and dropped:
+                if progress:
+                    progress(
+                        f"evidence {index}/{total} {focus_code} — повтор через "
+                        "недослівні цитати"
+                    )
+                retry_prompt = f"""{prompt}
+
+<VALIDATION_ERRORS>
+Попередня відповідь не пройшла перевірку: жодна наведена цитата не була
+дослівним неперервним фрагментом транскрипту. Створи ledger повторно. Скопіюй
+кожну цитату символ у символ з одного рядка TRANSCRIPT_CHUNK за вказаним
+timestamp; не виправляй граматику й розпізнавання, не перекладай і не
+перефразовуй. Краще повернути менше записів, але лише з точними цитатами.
+</VALIDATION_ERRORS>
+"""
+                raw_result = generate(retry_prompt, system)
+                result, dropped = _ground_evidence_ledger(raw_result, transcript)
+            if result:
+                chunk_results.append(result)
+            if progress:
+                progress(
+                    f"evidence {index}/{total} {focus_code} — готово "
+                    f"({time.monotonic() - started:.0f} с)"
+                )
+            if cache is not None:
+                cached_parts[key] = result
+                if cache_path is not None:
+                    atomic_write_json(cache_path, cache, mode=0o600)
+        if not chunk_results:
             raise CandidateEvaluationError(
                 f"Evidence {index}/{total} не містить жодної дослівної цитати"
             )
-        if progress:
-            progress(
-                f"evidence {index}/{total} — готово "
-                f"({time.monotonic() - started:.0f} с)"
-            )
-        results.append(result)
-        if cache is not None:
-            cached_parts[key] = result
-            if cache_path is not None:
-                atomic_write_json(cache_path, cache, mode=0o600)
+        results.append("\n\n".join(chunk_results))
     return results
 
 
@@ -444,7 +492,7 @@ def _consolidate_evidence(
     parts: list[str],
     *,
     transcript: str = "",
-    generate: Callable[[str, str], str],
+    generate: Callable[[str, str], str] | None = None,
     cache: dict | None = None,
     cache_path: Path | None = None,
     progress: Callable[[str], None] | None = None,
@@ -452,58 +500,34 @@ def _consolidate_evidence(
     if len(parts) == 1:
         result = parts[0]
         if progress:
-            progress("консолідація evidence — пропущено (1 чанк)")
-        if cache is not None and cache.get("consolidated_evidence") != result:
+            progress("консолідація evidence — детерміноване злиття (1 чанк)")
+        if cache is not None:
             cache["consolidated_evidence"] = result
             if cache_path is not None:
                 atomic_write_json(cache_path, cache, mode=0o600)
         return result
-    if cache is not None and cache.get("consolidated_evidence"):
-        cached = str(cache["consolidated_evidence"])
-        grounded, dropped = _ground_evidence_ledger(cached, transcript)
-        if dropped or not grounded.strip():
-            grounded = "\n\n".join(parts)
-            cache["consolidated_evidence"] = grounded
-            if cache_path is not None:
-                atomic_write_json(cache_path, cache, mode=0o600)
-            if progress:
-                progress("консолідація evidence — відновлено дослівні цитати")
-        elif progress:
-            progress("консолідація evidence — кеш")
-        return grounded
-    started = time.monotonic()
+    source = "\n\n".join(part for part in parts if part.strip())
+    headers = list(_EVIDENCE_HEADER.finditer(source))
+    unique: list[str] = []
+    seen: set[tuple[str, str, str]] = set()
+    for index, header in enumerate(headers):
+        end = headers[index + 1].start() if index + 1 < len(headers) else len(source)
+        block = source[header.start():end].strip()
+        quote = next((line for line in block.splitlines()[1:] if line.strip()), "")
+        metadata = header.group(0)
+        situation = re.search(r"\bsituation=([^|\n]+)", metadata)
+        key = (
+            header.group("timestamp").strip(),
+            situation.group(1).strip().casefold() if situation else "",
+            _normalized_quote(_quoted_line(quote)),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(block)
+    result = "\n\n".join(unique).strip() or source
     if progress:
-        progress("консолідація evidence — аналіз")
-    prompt = """Стисни evidence extraction до компактного evidence ledger для фінального
-оцінювання. Збережи IDs, speaker, type, situation, timestamp, dimensions, signals,
-найсильніші дослівні цитати, контрдокази, сигнали
-scope/autonomy/ambiguity/decision quality/impact/leverage та прогалини. Не
-перенумеровуй IDs і не об'єднуй різні situations. Не додавай нових фактів. Не
-роби фінальної оцінки. Максимум 9000 символів.
-
-<EVIDENCE_PARTS>
-""" + "\n\n".join(parts) + "\n</EVIDENCE_PARTS>"
-    result = generate(
-        prompt,
-        "Ти стискаєш доказову базу без втрати цитат і без нових висновків.",
-    )
-    source_ids = set(re.findall(r"(?mi)^\[E([A-Za-z0-9._-]+)\]", "\n".join(parts)))
-    result_ids = set(re.findall(r"(?mi)^\[E([A-Za-z0-9._-]+)\]", result))
-    if source_ids and not source_ids.issubset(result_ids):
-        # A prose/table rewrite destroys the machine-readable ledger. Keeping
-        # the original parts is safer than accepting lossy LLM consolidation.
-        result = "\n\n".join(parts)
-        if progress:
-            progress("консолідація evidence — відкинуто втрату evidence ID")
-    grounded, dropped = _ground_evidence_ledger(result, transcript)
-    if dropped or not grounded.strip():
-        result = "\n\n".join(parts)
-        if progress:
-            progress("консолідація evidence — відкинуто недослівні цитати")
-    else:
-        result = grounded
-    if progress:
-        progress(f"консолідація evidence — готово ({time.monotonic() - started:.0f} с)")
+        progress("консолідація evidence — детерміноване злиття")
     if cache is not None:
         cache["consolidated_evidence"] = result
         if cache_path is not None:
@@ -565,6 +589,30 @@ def _ground_report_quotes(report: str, evidence: str) -> str:
 
 def _normalize_report_evidence_ids(report: str) -> str:
     evidence_id = r"E[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)+"
+
+    def expand_range(match: re.Match[str]) -> str:
+        prefix = match.group("prefix")
+        start = int(match.group("start"))
+        end = int(match.group("end"))
+        if end < start or end - start > 20:
+            return match.group(0)
+        return ", ".join(f"[E{prefix}.{value}]" for value in range(start, end + 1))
+
+    report = re.sub(
+        r"\[E(?P<prefix>[A-Za-z0-9_-]+)\.(?P<start>\d+)-E?"
+        r"(?P=prefix)\.(?P<end>\d+)\]",
+        expand_range,
+        report,
+    )
+    report = re.sub(
+        r"\[E(?P<start_prefix>[A-Za-z0-9_-]+)\.(?P<start>\d+)-"
+        r"E(?P<end_prefix>[A-Za-z0-9_-]+)\.(?P<end>\d+)\]",
+        lambda match: (
+            f"[E{match.group('start_prefix')}.{match.group('start')}], "
+            f"[E{match.group('end_prefix')}.{match.group('end')}]"
+        ),
+        report,
+    )
     report = re.sub(
         rf"\[({evidence_id})\]([A-Za-z0-9_-]+)\]",
         lambda match: (
@@ -668,6 +716,7 @@ def _report_errors(
     active_levels: tuple[str, ...],
     evidence: str,
     transcript: str,
+    interviewer_debrief: str = "",
 ) -> list[str]:
     errors = [
         heading for heading in REQUIRED_REPORT_HEADINGS if heading not in report
@@ -692,6 +741,7 @@ def _report_errors(
             levels=active_levels,
             evidence=evidence,
             transcript=transcript,
+            interviewer_debrief=interviewer_debrief,
         )
     )
     return list(dict.fromkeys(errors))
@@ -711,6 +761,7 @@ def evaluate(
     cache_path: Path | None = None,
     cache_profile: dict | None = None,
     progress: Callable[[str], None] | None = None,
+    interviewer_debrief: str = "",
 ) -> str:
     if not candidate.strip():
         raise CandidateEvaluationError(
@@ -725,13 +776,23 @@ def evaluate(
     target_role, explicit_target_level = split_target_role_level(
         target_level, active_levels
     )
+    if explicit_target_level and all(
+        explicit_target_level.casefold() != level.casefold()
+        for level in active_levels
+    ):
+        # An explicit entry-level target (for example Trainee) must be present
+        # in the comparison even when the configured ladder starts at Junior.
+        active_levels = (explicit_target_level, *active_levels)
     clean_interviewers = [
         name for name in interviewers
         if name.strip() and name.strip().casefold() != candidate.strip().casefold()
     ]
     cache_meta = {
-        "schema_version": 5,
+        "schema_version": 6,
         "transcript_sha256": hashlib.sha256(transcript.encode("utf-8")).hexdigest(),
+        "interviewer_debrief_sha256": hashlib.sha256(
+            interviewer_debrief.encode("utf-8")
+        ).hexdigest(),
         "prompt_fingerprint": prompt_fingerprint(),
         "levels": list(active_levels),
         "target_spec": target_level,
@@ -796,6 +857,12 @@ Interview stage: {active_stage}
 <DECISION_POLICY>{decision_policy}</DECISION_POLICY>
 <BIAS_CHECKLIST>{bias_checklist}</BIAS_CHECKLIST>
 <EXTRACTED_EVIDENCE>{evidence}</EXTRACTED_EVIDENCE>
+<INTERVIEWER_DEBRIEF>
+{interviewer_debrief or 'Not supplied'}
+</INTERVIEWER_DEBRIEF>
+
+Debrief використовуй лише для self-check упереджень інтерв'юерів. Він не є
+доказом компетентності кандидата, не змінює scores, level fit або hiring risks.
 """,
             "Ти виконуєш reasoning-калібрування hiring evidence українською.",
         ).strip()
@@ -847,6 +914,11 @@ Meeting: {meeting_title}
 Date: {meeting_date}
 Interviewers: {', '.join(clean_interviewers) or '—'}
 
+Debrief нижче використовуй лише в секції self-check bias інтерв'юерів. Не
+цитуй його як candidate evidence і не використовуй для scores, level fit,
+ризиків або рекомендації. Якщо є симпатія через схожість/«типаж», прямо назви
+similarity або affinity bias та спосіб нейтралізації.
+
 <RUNTIME_RULES>
 {runtime_rules}
 </RUNTIME_RULES>
@@ -862,6 +934,9 @@ Interviewers: {', '.join(clean_interviewers) or '—'}
 <CALIBRATION_BRIEF>
 {calibration}
 </CALIBRATION_BRIEF>
+<INTERVIEWER_DEBRIEF>
+{interviewer_debrief or 'Not supplied'}
+</INTERVIEWER_DEBRIEF>
 """
     previous_invalid = str(cache.get("invalid_report", "")).strip()
     previous_errors = [
@@ -878,6 +953,7 @@ Interviewers: {', '.join(clean_interviewers) or '—'}
             active_levels=active_levels,
             evidence=evidence,
             transcript=transcript,
+            interviewer_debrief=interviewer_debrief,
         )
         if not repaired_errors:
             if cache_path is not None:
@@ -888,14 +964,11 @@ Interviewers: {', '.join(clean_interviewers) or '—'}
             if progress:
                 progress("фінальний звіт — виправлено з перевіреного кешу")
             return repaired_report
-    if previous_invalid:
-        prompt += """
-<PREVIOUS_INVALID_REPORT>
-Попередня генерація не пройшла структурну або мовну перевірку. Не копіюй її
-формулювання; виправ усі порушення нижче та поверни повний звіт.
-""" + previous_invalid[:12_000] + "\n</PREVIOUS_INVALID_REPORT>\n"
     if previous_errors:
         prompt += (
+            "\nПопередня генерація не пройшла перевірку. Поверни повний звіт "
+            "з нуля й виправ усі порушення нижче; не скорочуй або не обривай "
+            "обов'язкові секції.\n"
             "\n<VALIDATION_ERRORS>\n"
             + "\n".join(f"- {error}" for error in previous_errors)
             + "\n</VALIDATION_ERRORS>\n"
@@ -920,26 +993,59 @@ Interviewers: {', '.join(clean_interviewers) or '—'}
         active_levels=active_levels,
         evidence=evidence,
         transcript=transcript,
+        interviewer_debrief=interviewer_debrief,
     )
     if missing:
-        repeated = bool(
-            previous_invalid
-            and hashlib.sha256(previous_invalid.encode("utf-8")).hexdigest()
-            == hashlib.sha256(report.encode("utf-8")).hexdigest()
-            and previous_errors == missing
-        )
         if cache_path is not None:
             cache["invalid_report"] = report
             cache["invalid_report_errors"] = missing
             cache["invalid_report_at"] = utc_now()
             atomic_write_json(cache_path, cache, mode=0o600)
-        error_type = (
-            CandidateEvaluationTerminalError
-            if repeated else CandidateEvaluationError
+
+        if progress:
+            progress("фінальний звіт — локальне виправлення структури")
+        repair_prompt = prompt + (
+            "\nПопередній фінальний звіт нижче не пройшов детерміновану "
+            "перевірку. Не повторюй evidence extraction або reasoning. "
+            "Поверни повний виправлений звіт за тим самим REPORT_TEMPLATE; "
+            "усунь кожну помилку перевірки й не додавай нових фактів.\n"
+            "\n<VALIDATION_ERRORS>\n"
+            + "\n".join(f"- {error}" for error in missing)
+            + "\n</VALIDATION_ERRORS>\n"
+            "<INVALID_REPORT>\n"
+            + report
+            + "\n</INVALID_REPORT>\n"
         )
-        raise error_type(
-            "Звіт не пройшов перевірку структури; відсутні: " + ", ".join(missing)
+        repaired_report = generate(
+            repair_prompt,
+            "Ти виправляєш структуру готового hiring report без додаткового "
+            "reasoning. Пиши звіт лише українською. Не додавай фактів поза "
+            "EXTRACTED_EVIDENCE. Дослівні цитати не перекладай.",
+        ).strip()
+        repaired_report = _normalize_generated_report(repaired_report, evidence)
+        repaired_errors = _report_errors(
+            repaired_report,
+            candidate=candidate,
+            target_level=target_level,
+            active_stage=active_stage,
+            active_levels=active_levels,
+            evidence=evidence,
+            transcript=transcript,
+            interviewer_debrief=interviewer_debrief,
         )
+        if repaired_errors:
+            if cache_path is not None:
+                cache["invalid_report"] = repaired_report
+                cache["invalid_report_errors"] = repaired_errors
+                cache["invalid_report_at"] = utc_now()
+                atomic_write_json(cache_path, cache, mode=0o600)
+            raise CandidateEvaluationTerminalError(
+                "Звіт не пройшов локальне виправлення структури; відсутні: "
+                + ", ".join(repaired_errors)
+            )
+        report = repaired_report
+        if progress:
+            progress("фінальний звіт — структуру виправлено локально")
     if cache_path is not None and (
         "invalid_report" in cache
         or "invalid_report_at" in cache

@@ -477,6 +477,20 @@ class TranscriptionQualityTests(unittest.TestCase):
 
 
 class MeetingNoteMetadataTests(unittest.TestCase):
+    def test_candidate_evidence_excludes_discussion_after_last_candidate_turn(self):
+        transcript = """# Interview
+
+[10:00:00] Interviewer: Запитання.
+[10:01:00] Катерина Лисенко: Остання відповідь.
+[10:02:00] Interviewer: Внутрішня оцінка після виходу кандидатки.
+"""
+        clipped = audio._transcript_through_timestamp(transcript, "10:01:00")
+        self.assertIn("Остання відповідь", clipped)
+        self.assertNotIn("Внутрішня оцінка", clipped)
+        debrief = audio._transcript_after_timestamp(transcript, "10:01:00")
+        self.assertNotIn("Остання відповідь", debrief)
+        self.assertIn("Внутрішня оцінка", debrief)
+
     def test_diagnostic_meet_capture_creates_explicit_note_without_summary(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -640,13 +654,146 @@ class WatcherStateTests(unittest.TestCase):
             output.getvalue(),
         )
 
+    def test_ollama_retries_only_current_call_after_empty_response(self):
+        class Response:
+            def __init__(self, response):
+                self.response = response
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return json.dumps({"response": self.response}).encode()
+
+        with mock.patch.object(
+            summary_pipeline_module.urllib.request,
+            "urlopen",
+            side_effect=[Response(""), Response("готово")],
+        ) as urlopen:
+            result = summary_pipeline_module.ollama_generate("prompt")
+
+        self.assertEqual(result, "готово")
+        self.assertEqual(urlopen.call_count, 2)
+
+    def test_ollama_formats_saved_thinking_when_response_is_empty(self):
+        class Response:
+            def __init__(self, body):
+                self.body = body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return json.dumps(self.body).encode()
+
+        responses = [
+            Response({
+                "response": "",
+                "thinking": "Перевірив докази та визначив Junior.",
+                "done_reason": "length",
+                "eval_count": 2000,
+            }),
+            Response({
+                "response": "Готовий calibration brief",
+                "thinking": "",
+                "done_reason": "stop",
+                "eval_count": 120,
+            }),
+        ]
+        with mock.patch.object(
+            summary_pipeline_module.urllib.request,
+            "urlopen",
+            side_effect=responses,
+        ) as urlopen:
+            result = summary_pipeline_module.ollama_generate(
+                "original calibration",
+                think=True,
+                num_predict=2000,
+                thinking_recovery_prompt="Сформуй decision brief.",
+                fallback_num_predict=4000,
+                recovery_num_predict=3000,
+            )
+        self.assertEqual(result, "Готовий calibration brief")
+        self.assertEqual(urlopen.call_count, 2)
+        first = json.loads(urlopen.call_args_list[0].args[0].data)
+        finalizer = json.loads(urlopen.call_args_list[1].args[0].data)
+        self.assertTrue(first["think"])
+        self.assertFalse(finalizer["think"])
+        self.assertEqual(finalizer["options"]["num_predict"], 3000)
+        self.assertIn(
+            "Перевірив докази та визначив Junior", finalizer["prompt"]
+        )
+
+    def test_ollama_retries_only_calibration_with_larger_limit_without_thinking(self):
+        class Response:
+            def __init__(self, body):
+                self.body = body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return json.dumps(self.body).encode()
+
+        responses = [
+            Response({
+                "response": "",
+                "thinking": "",
+                "done_reason": "length",
+                "eval_count": 2000,
+            }),
+            Response({
+                "response": "Brief із більшого локального retry",
+                "thinking": "",
+                "done_reason": "stop",
+                "eval_count": 2300,
+            }),
+        ]
+        with mock.patch.object(
+            summary_pipeline_module.urllib.request,
+            "urlopen",
+            side_effect=responses,
+        ) as urlopen:
+            result = summary_pipeline_module.ollama_generate(
+                "original calibration",
+                think=True,
+                num_predict=2000,
+                thinking_recovery_prompt="Сформуй decision brief.",
+                fallback_num_predict=4000,
+            )
+        self.assertEqual(result, "Brief із більшого локального retry")
+        limits = [
+            json.loads(call.args[0].data)["options"]["num_predict"]
+            for call in urlopen.call_args_list
+        ]
+        self.assertEqual(limits, [2000, 4000])
+
     def test_candidate_reasoning_is_reserved_for_final_assessment(self):
-        with mock.patch.object(audio, "CANDIDATE_OLLAMA_THINK", True):
+        with mock.patch.object(
+            audio, "CANDIDATE_OLLAMA_THINK", True
+        ), mock.patch.object(
+            audio, "CANDIDATE_CALIBRATION_NUM_PREDICT", 2000
+        ):
             self.assertEqual(
                 audio._candidate_generation_options(
                     "Ти витягуєш докази з транскрипту"
                 ),
                 (1200, False),
+            )
+            self.assertEqual(
+                audio._candidate_generation_options(
+                    "Ти виконуєш reasoning-калібрування hiring evidence"
+                ),
+                (2000, True),
             )
             self.assertEqual(
                 audio._candidate_generation_options(
@@ -660,6 +807,53 @@ class WatcherStateTests(unittest.TestCase):
                 ),
                 (6144, False),
             )
+
+        with mock.patch.object(
+            audio, "CANDIDATE_OLLAMA_THINK", False
+        ), mock.patch.object(
+            audio, "CANDIDATE_CALIBRATION_NUM_PREDICT", 2000
+        ):
+            self.assertEqual(
+                audio._candidate_generation_options(
+                    "Ти виконуєш reasoning-калібрування hiring evidence"
+                ),
+                (3000, False),
+            )
+
+    def test_candidate_calibration_enables_local_reasoning_recovery(self):
+        with mock.patch.object(
+            audio, "_candidate_generation_options", return_value=(2000, True)
+        ), mock.patch.object(
+            summary_pipeline_module,
+            "ollama_generate",
+            return_value="calibration brief",
+        ) as generate:
+            result = audio._generate_candidate_response(
+                "prompt",
+                "Ти виконуєш reasoning-калібрування hiring evidence",
+            )
+        self.assertEqual(result, "calibration brief")
+        self.assertEqual(generate.call_args.kwargs["fallback_num_predict"], 4000)
+        self.assertEqual(generate.call_args.kwargs["recovery_num_predict"], 3000)
+        self.assertTrue(generate.call_args.kwargs["thinking_recovery_prompt"])
+
+    def test_exhausted_calibration_recovery_is_terminal(self):
+        import candidate_evaluation
+
+        with mock.patch.object(
+            audio, "_candidate_generation_options", return_value=(2000, True)
+        ), mock.patch.object(
+            summary_pipeline_module,
+            "ollama_generate",
+            side_effect=ValueError("Ollama повернула порожню відповідь"),
+        ):
+            with self.assertRaises(
+                candidate_evaluation.CandidateEvaluationTerminalError
+            ):
+                audio._generate_candidate_response(
+                    "prompt",
+                    "Ти виконуєш reasoning-калібрування hiring evidence",
+                )
 
     def test_candidate_title_routes_to_alternative_flow(self):
         transcript = """# Interview | Jane Doe
@@ -1690,6 +1884,43 @@ class WatcherStateTests(unittest.TestCase):
             manifest = json.loads((recordings / f"{session}.json").read_text())
             self.assertEqual(manifest["status"], "terminal_failed")
             self.assertEqual(manifest["processing_attempts"], 1)
+
+    def test_second_empty_response_failure_stops_retries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            recordings = root / "recordings"
+            failed = root / "failed"
+            notes = root / "notes"
+            for path in (recordings, failed, notes):
+                path.mkdir()
+            session = "2026-01-01_140000"
+            manifest_path = recordings / f"{session}.json"
+            pipeline_utils.atomic_write_json(
+                manifest_path,
+                {"status": "processing", "processing_attempts": 1},
+            )
+            patches = (
+                mock.patch.object(audio.project_paths, "RECORDINGS", recordings),
+                mock.patch.object(audio.project_paths, "FAILED", failed),
+                mock.patch.object(audio.project_paths, "NOTES", notes),
+            )
+            with patches[0], patches[1], patches[2]:
+                for attempt in (1, 2):
+                    pipeline_utils.update_manifest(
+                        manifest_path,
+                        status="processing",
+                        processing_attempts=attempt,
+                    )
+                    try:
+                        raise ValueError("Ollama повернула порожню відповідь")
+                    except ValueError:
+                        audio.handle_failure(session)
+
+            manifest = json.loads(manifest_path.read_text())
+            self.assertEqual(manifest["status"], "terminal_failed")
+            self.assertEqual(manifest["processing_attempts"], 2)
+            self.assertEqual(manifest["last_error_kind"], "empty_response")
+            self.assertEqual(manifest["same_error_attempts"], 2)
 
     def test_interrupted_processing_stops_after_retry_limit(self):
         with tempfile.TemporaryDirectory() as directory:

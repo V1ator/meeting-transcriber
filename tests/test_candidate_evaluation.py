@@ -281,6 +281,21 @@ class CandidateEvaluationTests(unittest.TestCase):
         )
         self.assertEqual(result, "\n\n".join(parts))
 
+    def test_deterministic_consolidation_deduplicates_same_observation(self):
+        record = (
+            "[E1B.1] speaker=candidate | type=candidate_live | situation=sql | "
+            "timestamp=10:01:00 | dimensions=critical_thinking | "
+            "signals=self_correction | phase=update | support=general\n"
+            "\"Я змінив відповідь після перевірки.\""
+        )
+        generate = mock.Mock()
+        result = candidate_evaluation._consolidate_evidence(
+            [record, record.replace("E1B.1", "E2B.1")],
+            generate=generate,
+        )
+        self.assertEqual(result.count("Я змінив відповідь"), 1)
+        generate.assert_not_called()
+
     def test_non_evaluation_report_has_no_scores_or_grade(self):
         report = candidate_evaluation.create_non_evaluation_report(
             candidate="Jane Doe",
@@ -310,7 +325,11 @@ class CandidateEvaluationTests(unittest.TestCase):
             + "\n"
             + ("The candidate has relevant experience but needs more evidence. " * 20)
         )
-        generate = mock.Mock(side_effect=["evidence", "calibration", report])
+        generate = mock.Mock(
+            side_effect=[
+                "evidence", "NO_EVIDENCE", "calibration", report, report
+            ]
+        )
         with self.assertRaisesRegex(
             candidate_evaluation.CandidateEvaluationError,
             "україномовний аналітичний текст",
@@ -473,10 +492,145 @@ class CandidateEvaluationTests(unittest.TestCase):
             "рівень `Lead` позначено Нижче лише через відсутність даних", errors
         )
 
+    def test_direct_negative_signal_can_support_below_level(self):
+        report = valid_ukrainian_report() + """
+| Middle | Нижче | Середня | Труднощі з оптимізацією [E3.1]. | SQL не перевірено. |
+"""
+        evidence = (
+            "[E3.1] speaker=candidate | type=candidate_live | situation=case | "
+            "timestamp=10:01:00 | dimensions=critical_thinking | "
+            "signals=missed_optimization"
+        )
+        errors = candidate_report_validator.validate_candidate_report(
+            report,
+            candidate="Jane Doe",
+            target="",
+            interview_stage="Невідомий",
+            levels=("Junior", "Middle"),
+            evidence=evidence,
+        )
+        self.assertNotIn(
+            "рівень `Middle` позначено Нижче лише через відсутність даних", errors
+        )
+
+    def test_reflection_cannot_be_missing_when_lesson_is_in_ledger(self):
+        report = valid_ukrainian_report() + (
+            "\n| Рефлексія | Недостатньо даних | Низька | Не перевірено |"
+        )
+        evidence = (
+            "[E1B.1] speaker=candidate | type=candidate_self_report | "
+            "situation=project_lesson | timestamp=10:01:00 | "
+            "dimensions=reflection | signals=lesson"
+        )
+        errors = candidate_report_validator.validate_candidate_report(
+            report,
+            candidate="Jane Doe",
+            target="",
+            interview_stage="Невідомий",
+            levels=("Junior",),
+            evidence=evidence,
+        )
+        self.assertIn(
+            "рефлексію позначено Недостатньо даних попри прямий "
+            "lesson/behavior_change evidence",
+            errors,
+        )
+
+    def test_debrief_affinity_must_be_named_in_bias_self_check(self):
+        report = valid_ukrainian_report().replace(
+            "## Самоперевірка упереджень оцінювача",
+            "## Самоперевірка упереджень оцінювача\n\n"
+            "- **Similarity:** Не виявлено.\n"
+            "- **Внесені коригування:** Не потрібні.",
+        )
+        errors = candidate_report_validator.validate_candidate_report(
+            report,
+            candidate="Jane Doe",
+            target="",
+            interview_stage="Невідомий",
+            levels=("Junior",),
+            interviewer_debrief=(
+                "[11:59:11] Інтерв'юер: Мені він понравився, це такий типаж."
+            ),
+        )
+        self.assertIn(
+            "self-check не відобразив similarity/affinity bias з debrief",
+            errors,
+        )
+
+    def test_unverified_competency_is_not_a_hiring_risk(self):
+        report = valid_ukrainian_report().replace(
+            "## Основні ризики найму",
+            "## Основні ризики найму\n\n"
+            "| Ризик | Статус | Доказ і умова прояву |\n"
+            "|---|---|---|\n"
+            "| SQL не перевірено | Умовний | Немає доказів [E1P.1] |",
+        )
+        errors = candidate_report_validator.validate_candidate_report(
+            report,
+            candidate="Jane Doe",
+            target="",
+            interview_stage="Невідомий",
+            levels=("Junior",),
+        )
+        self.assertIn(
+            "неперевірену компетенцію помилково оформлено як ризик найму",
+            errors,
+        )
+
+    def test_debrief_is_isolated_from_candidate_evidence(self):
+        report = valid_ukrainian_report()
+        generate = mock.Mock(
+            side_effect=["evidence", "NO_EVIDENCE", "calibration", report]
+        )
+        candidate_evaluation.evaluate(
+            "[00:01] Jane: hello",
+            candidate="Jane Doe",
+            target_level="",
+            levels=("Trainee", "Junior"),
+            meeting_title="Interview | Jane Doe",
+            meeting_date="2026-08-17",
+            interviewers=["Interviewer"],
+            interviewer_debrief="[00:02] Interviewer: Обговорення завершено.",
+            generate=generate,
+        )
+        self.assertNotIn(
+            "Обговорення завершено", generate.call_args_list[0].args[0]
+        )
+        self.assertIn(
+            "<INTERVIEWER_DEBRIEF>", generate.call_args_list[2].args[0]
+        )
+
+    def test_explicit_trainee_target_is_added_to_configured_ladder(self):
+        report = valid_ukrainian_report(
+            target_role="Data Analyst",
+            target_level="Trainee",
+            target_fit="Частково",
+        )
+        generate = mock.Mock(
+            side_effect=[
+                "evidence", "NO_EVIDENCE", "calibration", report, report
+            ]
+        )
+        candidate_evaluation.evaluate(
+            "[00:01] Jane: hello",
+            candidate="Jane Doe",
+            target_level="Trainee Data Analyst",
+            levels=("Junior", "Middle"),
+            meeting_title="Interview | Jane Doe | Trainee Data Analyst",
+            meeting_date="2026-08-17",
+            interviewers=["Interviewer"],
+            generate=generate,
+        )
+        self.assertIn(
+            "Levels to compare: Trainee, Junior, Middle",
+            generate.call_args_list[-1].args[0],
+        )
+
     def test_target_level_is_optional_for_level_comparison(self):
         report = valid_ukrainian_report()
         generate = mock.Mock(side_effect=[
-            "quoted evidence", "calibration", report
+            "quoted evidence", "NO_EVIDENCE", "calibration", report
         ])
         result = candidate_evaluation.evaluate(
             "[00:01] Jane: hello",
@@ -501,7 +655,7 @@ class CandidateEvaluationTests(unittest.TestCase):
             target_role="Analyst", target_level="Senior", target_fit="Частково"
         )
         generate = mock.Mock(side_effect=[
-            "quoted evidence", "calibration", report
+            "quoted evidence", "NO_EVIDENCE", "calibration", report
         ])
         result = candidate_evaluation.evaluate(
             "[00:01] Jane: hello",
@@ -513,9 +667,10 @@ class CandidateEvaluationTests(unittest.TestCase):
             generate=generate,
         )
         self.assertEqual(result, report)
-        self.assertEqual(generate.call_count, 3)
+        self.assertEqual(generate.call_count, 4)
         self.assertIn("<TRANSCRIPT_CHUNK", generate.call_args_list[0].args[0])
-        self.assertIn("<EXTRACTED_EVIDENCE>", generate.call_args_list[1].args[0])
+        self.assertIn("live tasks", generate.call_args_list[1].args[0])
+        self.assertIn("<EXTRACTED_EVIDENCE>", generate.call_args_list[2].args[0])
 
     def test_rejects_final_hire_on_non_final_stage(self):
         report = valid_ukrainian_report(
@@ -526,7 +681,9 @@ class CandidateEvaluationTests(unittest.TestCase):
             target_level="Junior",
         )
         generate = mock.Mock(
-            side_effect=["evidence", "calibration", report]
+            side_effect=[
+                "evidence", "NO_EVIDENCE", "calibration", report, report
+            ]
         )
         with self.assertRaisesRegex(
             candidate_evaluation.CandidateEvaluationError,
@@ -555,7 +712,9 @@ class CandidateEvaluationTests(unittest.TestCase):
             target_level="Junior",
         )
         generate = mock.Mock(
-            side_effect=["evidence", "calibration", report]
+            side_effect=[
+                "evidence", "NO_EVIDENCE", "calibration", report, report
+            ]
         )
         with self.assertRaisesRegex(
             candidate_evaluation.CandidateEvaluationError,
@@ -584,7 +743,7 @@ class CandidateEvaluationTests(unittest.TestCase):
             target_level="Junior",
         )
         generate = mock.Mock(
-            side_effect=["evidence", "calibration", report]
+            side_effect=["evidence", "NO_EVIDENCE", "calibration", report]
         )
         result = candidate_evaluation.evaluate(
             "[00:01] Jane: hello",
@@ -613,7 +772,9 @@ class CandidateEvaluationTests(unittest.TestCase):
             target_level="Не задано",
         )
         generate = mock.Mock(
-            side_effect=["evidence", "calibration", report]
+            side_effect=[
+                "evidence", "NO_EVIDENCE", "calibration", report, report
+            ]
         )
         with self.assertRaisesRegex(
             candidate_evaluation.CandidateEvaluationError,
@@ -636,7 +797,7 @@ class CandidateEvaluationTests(unittest.TestCase):
             cache_path = Path(directory) / "cache.json"
             first = mock.Mock(
                 side_effect=[
-                    "quoted evidence", "calibration", report
+                    "quoted evidence", "NO_EVIDENCE", "calibration", report
                 ]
             )
             candidate_evaluation.evaluate(
@@ -665,12 +826,16 @@ class CandidateEvaluationTests(unittest.TestCase):
         self.assertEqual(second.call_count, 1)
         self.assertIn("<EXTRACTED_EVIDENCE>", second.call_args.args[0])
 
-    def test_successful_retry_clears_previous_invalid_report(self):
+    def test_invalid_report_is_repaired_locally_without_rerunning_evidence(self):
         report = valid_ukrainian_report()
         with tempfile.TemporaryDirectory() as directory:
             cache_path = Path(directory) / "cache.json"
             invalid = "English report without the required structure"
-            first = mock.Mock(side_effect=["evidence", "calibration", invalid])
+            first = mock.Mock(
+                side_effect=[
+                    "evidence", "NO_EVIDENCE", "calibration", invalid, report
+                ]
+            )
             common = dict(
                 transcript="[00:01] Jane: hello",
                 candidate="Jane Doe",
@@ -681,20 +846,18 @@ class CandidateEvaluationTests(unittest.TestCase):
                 interviewers=["Interviewer"],
                 cache_path=cache_path,
             )
-            with self.assertRaises(candidate_evaluation.CandidateEvaluationError):
-                candidate_evaluation.evaluate(**common, generate=first)
-            failed_cache = candidate_evaluation.read_json(cache_path)
-            self.assertIn("invalid_report", failed_cache)
-            self.assertTrue(failed_cache["invalid_report_errors"])
-            retry = mock.Mock(return_value=report)
-            candidate_evaluation.evaluate(**common, generate=retry)
-            self.assertIn("<VALIDATION_ERRORS>", retry.call_args.args[0])
+            result = candidate_evaluation.evaluate(**common, generate=first)
+            self.assertEqual(result, report)
+            self.assertEqual(first.call_count, 5)
+            repair_prompt = first.call_args_list[-1].args[0]
+            self.assertIn("<VALIDATION_ERRORS>", repair_prompt)
+            self.assertIn("<INVALID_REPORT>", repair_prompt)
             cache = candidate_evaluation.read_json(cache_path)
         self.assertNotIn("invalid_report", cache)
         self.assertNotIn("invalid_report_at", cache)
         self.assertNotIn("invalid_report_errors", cache)
 
-    def test_identical_invalid_report_becomes_terminal(self):
+    def test_second_invalid_report_in_local_repair_becomes_terminal(self):
         invalid = "English report without the required structure"
         with tempfile.TemporaryDirectory() as directory:
             cache_path = Path(directory) / "cache.json"
@@ -708,21 +871,25 @@ class CandidateEvaluationTests(unittest.TestCase):
                 interviewers=["Interviewer"],
                 cache_path=cache_path,
             )
-            first = mock.Mock(side_effect=["evidence", "calibration", invalid])
-            with self.assertRaises(candidate_evaluation.CandidateEvaluationError):
-                candidate_evaluation.evaluate(**common, generate=first)
+            generate = mock.Mock(side_effect=[
+                "evidence", "NO_EVIDENCE", "calibration", invalid, invalid
+            ])
             with self.assertRaises(
                 candidate_evaluation.CandidateEvaluationTerminalError
             ):
-                candidate_evaluation.evaluate(
-                    **common, generate=mock.Mock(return_value=invalid)
-                )
+                candidate_evaluation.evaluate(**common, generate=generate)
+            self.assertEqual(generate.call_count, 5)
+            failed_cache = candidate_evaluation.read_json(cache_path)
+            self.assertIn("invalid_report", failed_cache)
+            self.assertTrue(failed_cache["invalid_report_errors"])
 
     def test_generation_profile_invalidates_evidence_cache(self):
         report = valid_ukrainian_report()
         with tempfile.TemporaryDirectory() as directory:
             cache_path = Path(directory) / "cache.json"
-            first = mock.Mock(side_effect=["evidence", "calibration", report])
+            first = mock.Mock(
+                side_effect=["evidence", "NO_EVIDENCE", "calibration", report]
+            )
             common = dict(
                 transcript="[00:01] Jane: hello",
                 candidate="Jane Doe",
@@ -737,12 +904,14 @@ class CandidateEvaluationTests(unittest.TestCase):
                 **common, generate=first, cache_profile={"think": False}
             )
             second = mock.Mock(
-                side_effect=["new evidence", "new calibration", report]
+                side_effect=[
+                    "new evidence", "NO_EVIDENCE", "new calibration", report
+                ]
             )
             candidate_evaluation.evaluate(
                 **common, generate=second, cache_profile={"think": True}
             )
-        self.assertEqual(second.call_count, 3)
+        self.assertEqual(second.call_count, 4)
 
     def test_reports_stage_progress_and_cache_hits(self):
         report = valid_ukrainian_report(target_level="Junior")
@@ -760,15 +929,69 @@ class CandidateEvaluationTests(unittest.TestCase):
                 cache_path=cache_path,
                 progress=progress.append,
             )
-            generate = mock.Mock(side_effect=["evidence", "calibration", report])
+            generate = mock.Mock(
+                side_effect=["evidence", "NO_EVIDENCE", "calibration", report]
+            )
             candidate_evaluation.evaluate(**common, generate=generate)
             generate = mock.Mock(return_value=report)
             candidate_evaluation.evaluate(**common, generate=generate)
 
-        self.assertTrue(any("evidence 1/1 — аналіз" in item for item in progress))
-        self.assertTrue(any("evidence 1/1 — кеш" in item for item in progress))
-        self.assertTrue(any("консолідація evidence — пропущено" in item for item in progress))
+        self.assertTrue(any("evidence 1/1 profile — аналіз" in item for item in progress))
+        self.assertTrue(any("evidence 1/1 behavior — кеш" in item for item in progress))
+        self.assertTrue(any("консолідація evidence — детерміноване" in item for item in progress))
         self.assertEqual(sum("фінальний звіт — готово" in item for item in progress), 2)
+
+    def test_retries_evidence_chunk_when_all_quotes_are_not_verbatim(self):
+        transcript = "[10:01:00] Jane Doe: Я перевірила дані та змінила рішення."
+        invalid = (
+            "[E1.1] speaker=candidate | type=candidate_live | situation=s1 | "
+            "timestamp=10:01:00 | dimensions=critical_thinking | signals=lesson\n"
+            '"Я проаналізувала інформацію та переглянула рішення."'
+        )
+        valid = (
+            "[E1.1] speaker=candidate | type=candidate_live | situation=s1 | "
+            "timestamp=10:01:00 | dimensions=critical_thinking | signals=lesson\n"
+            '"Я перевірила дані та змінила рішення."'
+        )
+        generate = mock.Mock(side_effect=[invalid, valid, "NO_EVIDENCE"])
+        progress = []
+
+        result = candidate_evaluation._extract_evidence(
+            transcript,
+            levels=("Junior",),
+            generate=generate,
+            progress=progress.append,
+        )
+
+        self.assertEqual(result, [valid])
+        self.assertEqual(generate.call_count, 3)
+        self.assertIn("<VALIDATION_ERRORS>", generate.call_args_list[1].args[0])
+        self.assertTrue(any("повтор через недослівні" in item for item in progress))
+
+    def test_normalizes_ambiguous_speaker_and_evidence_ranges(self):
+        transcript = "[10:01:00] Jane Doe: Точна відповідь кандидата."
+        ledger = (
+            "[E3.1] speaker=candidate|interviewer | type=candidate_live | "
+            "situation=s1 | timestamp=10:01:00 | dimensions=Critical Thinking | "
+            "signals=\n\"Точна відповідь кандидата.\""
+        )
+        grounded, dropped = candidate_evaluation._ground_evidence_ledger(
+            ledger, transcript
+        )
+        self.assertFalse(dropped)
+        self.assertIn("speaker=candidate |", grounded)
+        self.assertEqual(
+            candidate_evaluation._normalize_report_evidence_ids(
+                "Докази [E3.1-E3.3]."
+            ),
+            "Докази [E3.1], [E3.2], [E3.3].",
+        )
+        self.assertEqual(
+            candidate_evaluation._normalize_report_evidence_ids(
+                "Докази [E2.4-E3.3]."
+            ),
+            "Докази [E2.4], [E3.3].",
+        )
 
     def test_report_append_is_idempotent_per_evaluation_id(self):
         with tempfile.TemporaryDirectory() as directory:

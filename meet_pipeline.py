@@ -34,7 +34,7 @@ MEET_DOWNLOADS_DIR = Path(
 MEET_IMPORT_STABLE_SECONDS = max(
     1.0, float(os.environ.get("MEET_IMPORT_STABLE_SECONDS", "5"))
 )
-MAX_AUTO_RETRIES = int(os.environ.get("MAX_AUTO_RETRIES", "8"))
+MAX_AUTO_RETRIES = int(os.environ.get("MAX_AUTO_RETRIES", "5"))
 
 SessionBusy = audio_pipeline.SessionBusy
 session_lock = audio_pipeline.session_lock
