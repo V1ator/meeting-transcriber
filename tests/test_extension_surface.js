@@ -15,7 +15,7 @@ test("direct RTC mode never controls native Meet captions or layout", () => {
     fs.readFileSync(path.join(extension, "manifest.json"), "utf8")
   );
   const scripts = manifest.content_scripts.flatMap((entry) => entry.js || []);
-  assert.equal(manifest.version, "0.24.0");
+  assert.equal(manifest.version, "0.24.1");
   assert.equal(manifest.action.default_popup, "popup.html");
   for (const popupFile of ["popup.html", "popup.css", "popup.js"]) {
     assert.equal(fs.existsSync(path.join(extension, popupFile)), true, popupFile);

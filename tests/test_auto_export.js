@@ -4,11 +4,14 @@ const assert = require("node:assert/strict");
 const test = require("node:test");
 const AutoExport = require("../chrome-extension/auto-export.js");
 
-test("health changes trigger export but dynamic timestamps do not", () => {
+test("finalization and RTC health changes do not duplicate an export", () => {
   const base = {
     meetingCode: "abc-defg-hij",
     startedAt: "2026-08-12T10:00:00Z",
-    entries: [{ speaker: "Олег", text: "Тест" }],
+    endedAt: "2026-08-12T10:10:00Z",
+    entries: [{
+      speaker: "Олег", text: "Тест", startMs: 1_000, endMs: 2_000,
+    }],
     captureHealth: {
       channelState: "open",
       decodedCaptions: 1,
@@ -19,18 +22,38 @@ test("health changes trigger export but dynamic timestamps do not", () => {
   const first = AutoExport.signature(base);
   assert.equal(AutoExport.signature({
     ...base,
+    endedAt: "2026-08-12T10:10:03Z",
+    entries: [{
+      speaker: "Олег", text: "Тест", startMs: 1_000, endMs: 4_500,
+    }],
     captureHealth: {
       ...base.captureHealth,
       finalizedAtMs: 20_000,
       exportedAt: "2026-08-12T10:20:00Z",
+      channelState: "missing",
+      disconnectCount: 1,
+      lastFailureReason: "closed",
     },
+  }), first);
+});
+
+test("new transcript content still triggers a new export", () => {
+  const base = {
+    meetingCode: "abc-defg-hij",
+    startedAt: "2026-08-12T10:00:00Z",
+    entries: [{ speaker: "Олег", text: "Перша репліка" }],
+  };
+  const first = AutoExport.signature(base);
+  assert.notEqual(AutoExport.signature({
+    ...base,
+    entries: [
+      ...base.entries,
+      { speaker: "Анна", text: "Нова репліка" },
+    ],
   }), first);
   assert.notEqual(AutoExport.signature({
     ...base,
-    captureHealth: {
-      ...base.captureHealth,
-      disconnectCount: 1,
-    },
+    entries: [{ speaker: "Олег", text: "Змінений текст" }],
   }), first);
 });
 

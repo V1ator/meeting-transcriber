@@ -40,28 +40,19 @@
   }
 
   function signature(exported) {
-    const health = exported?.captureHealth || {};
     return JSON.stringify({
       meetingCode: exported?.meetingCode || "",
       startedAt: exported?.startedAt || "",
       meetingTitle: exported?.meetingTitle || "",
-      participants: exported?.participants || [],
-      entries: exported?.entries || [],
+      // Export lifecycle events may finalize endMs and replace live RTC health
+      // with a closed/missing state. Neither change means that the transcript
+      // itself changed, so keep the deduplication key semantic and stable.
+      entries: (exported?.entries || []).map((entry) => ({
+        speaker: entry?.speaker || "",
+        text: entry?.text || "",
+        ...(entry?.kind ? { kind: entry.kind } : {}),
+      })),
       diagnosticOnly: Boolean(exported?.diagnosticOnly),
-      captureHealth: {
-        rtcOpenedAtMs: health.rtcOpenedAtMs || 0,
-        firstCaptionMs: health.firstCaptionMs || 0,
-        lastCaptionMs: health.lastCaptionMs || 0,
-        decodedCaptions: health.decodedCaptions || 0,
-        decodeFailures: health.decodeFailures || 0,
-        rtcPackets: health.rtcPackets || 0,
-        disconnectCount: health.disconnectCount || 0,
-        hadRtcUnavailable: Boolean(health.hadRtcUnavailable),
-        recovered: Boolean(health.recovered),
-        lastFailureReason: health.lastFailureReason || "",
-        channelState: health.channelState || "",
-        unparsedPacketSample: health.unparsedPacketSample || null,
-      },
     });
   }
 
